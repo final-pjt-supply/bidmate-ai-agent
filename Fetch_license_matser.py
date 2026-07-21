@@ -3,9 +3,6 @@
 사용법:
     G2B_SERVICE_KEY=<Decoding 서비스키> python fetch_license_master.py
 
-선행 조건:
-    공공데이터포털에서 '조달청_나라장터 업종 및 근거법규서비스' 활용신청 (자동승인)
-
 출력:
     industry_codes_raw.json     — API 원본 전체 (감사/재현용)
     seed_license_master_v2.sql  — license_master 전수 + 별칭 INSERT (공식 업종코드 기준)
@@ -15,11 +12,11 @@
       주석으로 포함됨 — 팀 확인 후 주석 해제하여 실행.
     - 에러 응답이 HTTP 200으로 오는 나라장터 특성 반영('response' 키 확인).
 """
+
 import json
 import os
 import sys
 import time
-
 import requests
 
 BASE_URL = "http://apis.data.go.kr/1230000/ao/IndstrytyBaseLawrgltInfoService"
