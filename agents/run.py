@@ -1,15 +1,12 @@
 """진입점 — 프레임워크 비의존 순수 함수. 백엔드 호출 방식 확정 전까지 유지."""
-import logging
 from functools import lru_cache
 
 from agents.graph import build_graph
-from agents.nodes.respond import build_summary
+from agents.nodes.respond import build_summary, respond_node
 from agents.nodes.router import router_node
-from agents.nodes.respond import respond_node
 from agents.schemas import (AgentRequest, AgentResponse, Filters,
                             PendingClarify, SessionContext)
 
-logger = logging.getLogger(__name__)
 _MAX_BID_IDS = 20
 
 

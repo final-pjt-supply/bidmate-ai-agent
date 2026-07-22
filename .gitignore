@@ -304,3 +304,6 @@ experiments/embedding/*_sweep_results.json
 
 # SDD 스크래치(로컬 전용)
 .superpowers/
+
+# Claude Code 하네스 산출물
+.claude/
