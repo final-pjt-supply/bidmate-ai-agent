@@ -216,3 +216,91 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ════════════════════════════════════════════
+# 프로젝트 로컬 규칙 (bidding-agent)
+# ════════════════════════════════════════════
+# ── Python ──────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ── 실험·비교 코드 (experiment / comparison) ──
+# 기능 코드가 아니라 방식 비교·튜닝용 스크립트는 공유하지 않는다.
+transforming/compare/
+transforming/testing.py
+transforming/trans_test_optimizing.py
+transforming/trans_test_optimizing_parallel.py
+
+# ── 생성·중간 데이터 (generated / intermediate) ──
+transforming/output/
+pipeline/realtime/tests/output/
+
+# ── 원본/변환 샘플 문서 (sample & converted docs) ──
+# 입력 원본과 변환 결과물은 데이터라 추적하지 않는다.
+docs/
+*.hwp
+*.hwpx
+*.pdf
+/*.txt
+!requirement.txt
+
+# 환경변수 파일
+.env
+
+# ── 개인 문서 (personal docs) ──
+# 로컬 작업용 문서(project.md, CLAUDE.md)와 docs/는 공유하지 않는다.
+CLAUDE.md
+project.md
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 환경변수 / 비밀키
+.env
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code / 개인 문서 (로컬 전용 — 공유 안 함)
+CLAUDE.md
+project.md
+docs/
+
+# Sample data
+data/sample/*.pdf
+data/sample/output/
+batch-reports/
+
+# ── SAM / 빌드 산출물 · 생성 매니페스트 (로컬 전용) ──
+.aws-sam/
+samconfig.toml
+manifest-*.csv
+
+# ── AWS SAM 빌드 산출물 (sam build 결과, 재생성 가능) ──
+.aws-sam/
+
+# ── 임베딩 실험 산출물 (원본 데이터/청크/벡터 — 재현은 스크립트로, 스크립트와
+#    RESULTS.md만 커밋) ──
+experiments/embedding/data/
+experiments/embedding/chunks/
+experiments/embedding/vectors/
+# eval_set.json(확정된 평가셋)은 커밋하되, split_eval_set.py로 재생성되는
+# 튜닝/검증 분할과 run_recall_eval.py의 스윕 원시 결과는 재현 가능한
+# 산출물이라 추적하지 않는다.
+experiments/embedding/eval_set_tune.json
+experiments/embedding/eval_set_val.json
+experiments/embedding/*_sweep_results.json
+
+# SDD 스크래치(로컬 전용)
+.superpowers/
