@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _PROMPT = (Path(__file__).parent.parent / "prompts" / "respond.md").read_text(
     encoding="utf-8")
 _NUM_RE = re.compile(r"\d+(?:[,.]\d+)*")
+_DATE_TOKEN_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$")
 
 
 def _eligibility_block(state) -> str:
@@ -44,16 +45,21 @@ def check_grounding(answer: str, signals: str) -> list[str]:
     """답변의 수치가 신호에 없으면 위반 목록으로 반환.
 
     신호 토큰은 날짜(2024.07.22)·천단위 콤마(10,000,000)처럼 여러 구획이
-    하나의 정규식 토큰으로 묶인다. 답변이 그 구획 일부나 콤마 제거형(정규화)을
-    인용해도 그라운딩 위반으로 보지 않도록, 허용 집합을 원본 토큰 ∪ 콤마 제거형
-    ∪ `[.,]` 분해 구획으로 넓힌다. 단, 토큰 전체의 마침표 제거는 하지 않는다
-    (그러면 "2.5"가 "25"와 같아져 서로 다른 값이 섞인다).
+    하나의 정규식 토큰으로 묶인다. 답변이 그 구획 일부(날짜)나 콤마 제거형
+    (정규화된 금액)을 인용해도 그라운딩 위반으로 보지 않도록, 허용 집합을
+    원본 토큰 ∪ 콤마 제거형 ∪ (날짜형 토큰 한정) `.` 분해 구획으로 넓힌다.
+
+    구획 분해는 `YYYY.M.D` 형태(`_DATE_TOKEN_RE`)의 날짜 토큰에만 적용한다.
+    모든 토큰에 적용하면 "2.5배"의 "5"나 "87.745%"의 "87", "1,234,567"의
+    "234" 같은 소수·금액 내부 자릿수가 무관한 답변 수치와 우연히 겹쳐
+    그라운딩 검증을 무력화한다 — 날짜가 아닌 토큰은 분해하지 않는다.
     """
     signal_tokens = _NUM_RE.findall(signals)
     allowed = set(signal_tokens)
     for tok in signal_tokens:
         allowed.add(tok.replace(",", ""))
-        allowed.update(re.split(r"[.,]", tok))
+        if _DATE_TOKEN_RE.match(tok):
+            allowed.update(tok.split("."))
 
     violations = []
     for tok in _NUM_RE.findall(answer):

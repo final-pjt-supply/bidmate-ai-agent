@@ -66,3 +66,18 @@ def test_grounding_still_flags_unrelated_numbers():
     signals = "마감일 2026.08.01"
     violations = check_grounding("통과 확률은 93%입니다", signals)
     assert "93" in " ".join(violations)
+
+
+def test_grounding_flags_decimal_segments():
+    assert check_grounding("통과 확률은 5%입니다", "여유율 2.5배") == ["5"]
+
+
+def test_grounding_flags_partial_threshold():
+    signals = "요구 실적 10억 대비 보유 25억, 여유율 2.5배 / 낙찰하한율 87.745%"
+    violations = check_grounding("통과 확률 87%로 예상됩니다", signals)
+    assert "87" in violations
+
+
+def test_grounding_flags_comma_inner_group():
+    violations = check_grounding("낙찰 건수는 234건입니다", "추정가격 1,234,567원")
+    assert "234" in violations
