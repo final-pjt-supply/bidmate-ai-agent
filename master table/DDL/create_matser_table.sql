@@ -5,7 +5,7 @@
 -- 멱등: IF NOT EXISTS — 재실행 안전
 -- ============================================================================
 
--- ① 면허/등록 마스터 (회사가 갖는 사업 자격)
+-- 면허/등록 마스터 (회사가 갖는 사업 자격)
 CREATE TABLE IF NOT EXISTS license_master (
   license_code   VARCHAR(20) PRIMARY KEY,   -- 나라장터 업종코드(indstrytyCd) 차용 예정
   license_name   VARCHAR(100) NOT NULL,     -- 표준명
@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS license_master (
   is_active      BOOLEAN DEFAULT TRUE       -- 업종 폐지 대응
 );
 
--- ② 행정구역 마스터 (지역제한 계층 매칭)
+-- 행정구역 마스터 (지역제한 계층 매칭)
 CREATE TABLE IF NOT EXISTS region_master (
   region_code    VARCHAR(10) PRIMARY KEY,   -- 법정동코드 기반 (시도 2자리/시군구 5자리)
   region_name    VARCHAR(50) NOT NULL,
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS region_master (
   parent_code    VARCHAR(10) REFERENCES region_master  -- 시군구→시도 (계층 통과 매칭용)
 );
 
--- ③ 기술인력 자격/등급 마스터 (개인이 갖는 자격 — 인원수 비교용)
+-- 기술인력 자격/등급 마스터 (개인이 갖는 자격 — 인원수 비교용)
 CREATE TABLE IF NOT EXISTS personnel_grade_master (
   qual_code      VARCHAR(20) PRIMARY KEY,   -- 행정표준코드 '국가자격면허' 코드
   qual_name      VARCHAR(100) NOT NULL,
@@ -31,7 +31,16 @@ CREATE TABLE IF NOT EXISTS personnel_grade_master (
   field          VARCHAR(50)                -- 자격명 어간 (분야)
 );
 
--- ④ 통합 별칭 테이블 (표기 변형 → 표준 코드 번역 사전, 3개 도메인 공용)
+-- 물품코드 마스터
+CREATE TABLE IF NOT EXISTS item_code_master (
+  item_code      VARCHAR(10) PRIMARY KEY,   -- 8자리=품명 / 10자리=세부품명
+  item_name      VARCHAR(300) NOT NULL,
+  parent_code    VARCHAR(10),               -- 10자리 → 앞 8자리
+  is_active      BOOLEAN DEFAULT TRUE,      -- useYn
+  is_sme_product BOOLEAN DEFAULT FALSE      -- 중기간 경쟁제품 (별도 갱신)
+);
+
+-- 통합 별칭 테이블 (표기 변형 → 표준 코드 번역 사전, 3개 도메인 공용)
 CREATE TABLE IF NOT EXISTS master_alias (
   entity_type    VARCHAR(20) NOT NULL,      -- 'license' / 'region' / 'personnel'
   alias_text     VARCHAR(200) NOT NULL,
