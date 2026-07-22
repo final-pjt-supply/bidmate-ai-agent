@@ -5,6 +5,7 @@ import pytest
 
 import agents.llm as llm
 from agents.llm import ModelTier
+from agents.schemas import QueryIntent
 
 
 def _fake_response(text: str) -> dict:
@@ -65,3 +66,33 @@ def test_retry_exhausted_raises(monkeypatch):
 
     with pytest.raises(ClientError):
         llm.invoke(ModelTier.ROUTER, [{"role": "user", "content": "hi"}])
+
+
+def _assert_bedrock_compatible(node):
+    """모든 object 노드(root, $defs 내부 포함)에 additionalProperties: False가
+    있고, 어디에도 "default" 키가 남아있지 않은지 재귀적으로 검사."""
+    if isinstance(node, dict):
+        assert "default" not in node
+        if node.get("type") == "object" or "properties" in node:
+            assert node.get("additionalProperties") is False
+        for v in node.values():
+            _assert_bedrock_compatible(v)
+    elif isinstance(node, list):
+        for v in node:
+            _assert_bedrock_compatible(v)
+
+
+def test_invoke_prepares_query_intent_schema_for_bedrock(monkeypatch):
+    client = MagicMock()
+    client.invoke_model.return_value = _fake_response(
+        '{"type": "full", "action": "answer", "scope": "inherit", '
+        '"entry_bid_scope": "keep", "new_filters": {}, '
+        '"normalized_query": "q", "clarify_message": null}')
+    monkeypatch.setattr(llm, "_client", lambda: client)
+
+    out = llm.invoke(ModelTier.ROUTER, [{"role": "user", "content": "hi"}],
+                     output_schema=QueryIntent.model_json_schema())
+    assert out["action"] == "answer"
+    body = json.loads(client.invoke_model.call_args.kwargs["body"])
+    schema = body["output_config"]["format"]["schema"]
+    _assert_bedrock_compatible(schema)

@@ -1,4 +1,5 @@
 """Bedrock 호출 래퍼 — 티어 스위칭·재시도. 모델 ID는 여기에만 둔다."""
+import copy
 import json
 import logging
 import os
@@ -31,6 +32,27 @@ _RETRYABLE = {"ThrottlingException", "ServiceUnavailableException",
               "ModelTimeoutException", "InternalServerException"}
 
 
+def _prepare_schema(schema: dict) -> dict:
+    """Bedrock 구조화 출력 호환 후처리 — deep copy 후:
+    - object 스키마(모든 "type": "object" 또는 "properties" 보유 노드)에
+      "additionalProperties": False 강제 (Anthropic structured outputs 요구사항).
+    - "default" 키는 어디에 있든 제거(모델 스키마의 "default": null 등은
+      Bedrock structured output 검증에서 거부됨).
+    properties/$defs/items/anyOf/allOf/oneOf를 재귀적으로 처리한다.
+    """
+    def _walk(node):
+        if isinstance(node, dict):
+            node = {k: _walk(v) for k, v in node.items() if k != "default"}
+            if node.get("type") == "object" or "properties" in node:
+                node["additionalProperties"] = False
+            return node
+        if isinstance(node, list):
+            return [_walk(v) for v in node]
+        return node
+
+    return _walk(copy.deepcopy(schema))
+
+
 @lru_cache(maxsize=1)
 def _client():
     # .env의 비표준 키 이름을 boto3 표준 인자로 명시 재매핑 (CLAUDE.md 규칙)
@@ -54,7 +76,8 @@ def invoke(tier: ModelTier, messages: list[dict], system: str | None = None,
         body["system"] = system
     if output_schema:
         body["output_config"] = {
-            "format": {"type": "json_schema", "schema": output_schema}}
+            "format": {"type": "json_schema",
+                       "schema": _prepare_schema(output_schema)}}
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
@@ -84,9 +107,7 @@ if __name__ == "__main__":               # python -m agents.llm — 실호출 �
                      max_tokens=50)
         logger.info("smoke tier=%s latency_ms=%.0f ok=%s",
                     tier, (time.monotonic() - t0) * 1000, bool(out))
-    schema = {"type": "object", "additionalProperties": False,
-              "required": ["greeting"],
-              "properties": {"greeting": {"type": "string"}}}
+    from agents.schemas import QueryIntent
     out = invoke(ModelTier.ROUTER, [{"role": "user", "content": "인사해"}],
-                 output_schema=schema, max_tokens=100)
+                 output_schema=QueryIntent.model_json_schema(), max_tokens=100)
     logger.info("smoke structured ok=%s", isinstance(out, dict))
