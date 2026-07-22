@@ -1,0 +1,299 @@
+"""하이브리드 검색 도구 (C 파트 핵심).
+
+bid_chunks 인덱스에 대해 벡터(knn) + 키워드(BM25)를 병합 검색한다.
+- 벡터: Cloudflare bge-m3로 질의를 임베딩 → knn_vector 검색
+- 키워드: 같은 질의 텍스트로 text 필드 BM25 검색 (한국어 분석기)
+- 둘을 bool.should 로 묶어 점수를 합산 (search pipeline 없이 동작하는 방식)
+- bid_ids / types 로 사전 필터링 가능
+
+두 가지 진입점:
+- search_bids()          : 청크 단위 결과. 챗봇 RAG용 (같은 공고 여러 청크 유지).
+- search_bids_grouped()  : 공고 단위 결과. 추천 목록용 (bid_id 중복 제거).
+
+이 함수들은 프레임워크 독립적인 순수 파이썬이다.
+A의 LangGraph가 tool로 감싸든, 배치가 직접 부르든 그대로 재사용된다.
+"""
+from __future__ import annotations
+
+from agents.clients.embedding import embed_query
+from agents.clients.opensearch import get_client
+from agents.config import get_settings
+from agents.schemas import BidHit, BidSearchResult, Chunk, RecommendedBid, SearchResult
+
+# knn 후보 폭. top_k보다 넉넉히 잡아야 병합 후 상위 정렬이 안정적이다.
+_KNN_CANDIDATE_MULTIPLIER = 5
+
+# 공고 단위 검색 시, 중복 제거로 개수가 줄어드는 것을 감안해
+# 목표 공고 수의 몇 배만큼 청크를 미리 뽑을지.
+_DEDUPE_OVERFETCH = 3
+
+# 추천 시 마감·차수 필터로 걸러질 것을 감안한 추가 여유분.
+_RECOMMEND_OVERFETCH = 3
+
+
+def _build_query(
+    *,
+    text: str,
+    vector: list[float],
+    bid_ids: list[str] | None,
+    types: list[str] | None,
+    size: int,
+    knn_weight: float,
+    bm25_weight: float,
+) -> dict:
+    """벡터 + 키워드를 bool.should 로 병합한 OpenSearch 쿼리 본문을 만든다."""
+    filters: list[dict] = []
+    if bid_ids:
+        filters.append({"terms": {"bid_id": bid_ids}})
+    if types:
+        filters.append({"terms": {"type": types}})
+
+    knn_clause = {
+        "knn": {
+            "vector": {
+                "vector": vector,
+                "k": size * _KNN_CANDIDATE_MULTIPLIER,
+                "boost": knn_weight,
+                **({"filter": {"bool": {"filter": filters}}} if filters else {}),
+            }
+        }
+    }
+
+    bm25_clause = {
+        "match": {
+            "text": {
+                "query": text,
+                "boost": bm25_weight,
+            }
+        }
+    }
+
+    bool_query: dict = {
+        "should": [knn_clause, bm25_clause],
+        "minimum_should_match": 1,
+    }
+    if filters:
+        bool_query["filter"] = filters
+
+    return {
+        "size": size,
+        "query": {"bool": bool_query},
+        "_source": {"excludes": ["vector"]},
+    }
+
+
+def _to_chunk(hit: dict) -> Chunk:
+    src = hit["_source"]
+    return Chunk(
+        chunk_id=hit["_id"],
+        bid_id=src["bid_id"],
+        document_id=src.get("document_id", ""),
+        chunk_idx=src.get("chunk_idx", 0),
+        text=src.get("text", ""),
+        type=src.get("type", ""),
+        score=hit["_score"],
+    )
+
+
+def _run_search(
+    query: str,
+    *,
+    size: int,
+    bid_ids: list[str] | None,
+    types: list[str] | None,
+    knn_weight: float | None,
+    bm25_weight: float | None,
+) -> tuple[list[Chunk], int]:
+    """공통 검색 실행부. (청크 리스트, 전체 매칭 수)를 반환한다."""
+    s = get_settings()
+    knn_weight = s.knn_weight if knn_weight is None else knn_weight
+    bm25_weight = s.bm25_weight if bm25_weight is None else bm25_weight
+
+    vector = embed_query(query)
+    body = _build_query(
+        text=query,
+        vector=vector,
+        bid_ids=bid_ids,
+        types=types,
+        size=size,
+        knn_weight=knn_weight,
+        bm25_weight=bm25_weight,
+    )
+    resp = get_client().search(index=s.opensearch_index, body=body)
+
+    hits = resp.get("hits", {})
+    chunks = [_to_chunk(h) for h in hits.get("hits", [])]
+    total = hits.get("total", {})
+    total_hits = total.get("value", 0) if isinstance(total, dict) else int(total or 0)
+    return chunks, total_hits
+
+
+def search_bids(
+    query: str,
+    *,
+    bid_ids: list[str] | None = None,
+    types: list[str] | None = None,
+    top_k: int | None = None,
+    knn_weight: float | None = None,
+    bm25_weight: float | None = None,
+) -> SearchResult:
+    """청크 단위 하이브리드 검색 (챗봇 RAG용).
+
+    같은 공고의 여러 청크가 그대로 유지된다. 특정 공고 Q&A 시 근거 청크를
+    빠짐없이 모으기 위한 용도.
+
+    Args:
+        query: 사용자 질의 텍스트.
+        bid_ids: 지정 시 해당 공고들로만 검색 범위 제한 (Case 2 문맥).
+        types: 청크 종류 필터. None이면 text/table/box 전부 포함.
+        top_k: 반환 청크 수. None이면 설정 기본값.
+        knn_weight / bm25_weight: 벡터·키워드 가중치. None이면 설정 기본값.
+
+    Returns:
+        SearchResult (점수 내림차순 청크 목록).
+    """
+    query = (query or "").strip()
+    if not query:
+        return SearchResult(query=query, chunks=[], total_hits=0)
+
+    top_k = top_k or get_settings().default_top_k
+    chunks, total_hits = _run_search(
+        query,
+        size=top_k,
+        bid_ids=bid_ids,
+        types=types,
+        knn_weight=knn_weight,
+        bm25_weight=bm25_weight,
+    )
+    return SearchResult(query=query, chunks=chunks, total_hits=total_hits)
+
+
+def _dedupe_by_bid(chunks: list[Chunk]) -> list[BidHit]:
+    """점수 내림차순 청크 리스트를 bid_id 기준으로 묶어 공고 단위로 만든다.
+
+    각 공고의 첫(=최고점) 청크가 대표가 되고, 해당 공고에서 걸린 청크 수를 센다.
+    입력이 이미 점수 내림차순이므로, 처음 만난 bid_id의 청크가 곧 최고점이다.
+    """
+    by_bid: dict[str, BidHit] = {}
+    for c in chunks:
+        existing = by_bid.get(c.bid_id)
+        if existing is None:
+            by_bid[c.bid_id] = BidHit(
+                bid_id=c.bid_id,
+                score=c.score,
+                top_chunk=c,
+                matched_chunks=1,
+            )
+        else:
+            existing.matched_chunks += 1
+    # dict는 삽입 순서를 보존하므로 이미 점수 내림차순이다.
+    return list(by_bid.values())
+
+
+def search_bids_grouped(
+    query: str,
+    *,
+    bid_ids: list[str] | None = None,
+    types: list[str] | None = None,
+    top_k: int | None = None,
+    knn_weight: float | None = None,
+    bm25_weight: float | None = None,
+) -> BidSearchResult:
+    """공고 단위 하이브리드 검색 (추천 목록용).
+
+    bid_id 기준 중복을 제거해, 서로 다른 공고 top_k개를 반환한다.
+    중복 제거로 개수가 줄어드는 것을 감안해 내부적으로 넉넉히 검색한 뒤 자른다.
+
+    Args:
+        query: 사용자 질의 텍스트.
+        bid_ids: 지정 시 해당 공고들로만 검색 범위 제한.
+        types: 청크 종류 필터. None이면 전부 포함.
+        top_k: 반환할 공고 수. None이면 설정 기본값.
+        knn_weight / bm25_weight: 벡터·키워드 가중치. None이면 설정 기본값.
+
+    Returns:
+        BidSearchResult (점수 내림차순 공고 목록).
+    """
+    query = (query or "").strip()
+    if not query:
+        return BidSearchResult(query=query, bids=[], total_hits=0)
+
+    top_k = top_k or get_settings().default_top_k
+    # 중복 제거 후에도 top_k개 공고가 남도록 넉넉히 청크를 뽑는다.
+    fetch_size = top_k * _DEDUPE_OVERFETCH
+
+    chunks, total_hits = _run_search(
+        query,
+        size=fetch_size,
+        bid_ids=bid_ids,
+        types=types,
+        knn_weight=knn_weight,
+        bm25_weight=bm25_weight,
+    )
+
+    bids = _dedupe_by_bid(chunks)[:top_k]
+    return BidSearchResult(query=query, bids=bids, total_hits=total_hits)
+
+
+def recommend_bids(
+    query: str,
+    *,
+    top_k: int | None = None,
+    types: list[str] | None = None,
+    only_open: bool = True,
+    latest_ord_only: bool = True,
+) -> list[RecommendedBid]:
+    """추천 공고 목록을 만든다: 검색(OpenSearch) + 공고 정보(PostgreSQL).
+
+    흐름
+      1) 하이브리드 검색으로 관련 청크를 넉넉히 뽑는다
+      2) bid_id 기준 중복 제거 (공고당 1건)
+      3) 마감 지난 공고 제외 (only_open)
+      4) 재공고 차수가 옛것이면 제외 (latest_ord_only)
+      5) bid_table에서 공고명·기관·마감일 등을 채운다
+
+    Args:
+        query: 사용자 질의.
+        top_k: 반환할 공고 수. None이면 설정 기본값.
+        types: 청크 종류 필터.
+        only_open: True면 마감 지난 공고를 제외한다.
+        latest_ord_only: True면 같은 공고번호 중 최신 차수만 남긴다.
+
+    Returns:
+        RecommendedBid 목록 (검색 점수 내림차순).
+    """
+    from agents.tools.bid_info import fetch_bid_info, filter_open_bids, latest_ord_map
+
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    top_k = top_k or get_settings().default_top_k
+
+    # 1~2) 필터로 걸러질 것을 감안해 넉넉히 뽑는다
+    search_result = search_bids_grouped(
+        query, types=types, top_k=top_k * _RECOMMEND_OVERFETCH
+    )
+    hits = search_result.bids
+    if not hits:
+        return []
+
+    bid_ids = [h.bid_id for h in hits]
+
+    # 3) 마감 전인 것만
+    if only_open:
+        open_ids = filter_open_bids(bid_ids)
+        hits = [h for h in hits if h.bid_id in open_ids]
+
+    # 4) 최신 차수만 (테이블 기준으로 판단)
+    if latest_ord_only and hits:
+        latest = set(latest_ord_map([h.bid_id for h in hits]).values())
+        hits = [h for h in hits if h.bid_id in latest]
+
+    hits = hits[:top_k]
+    if not hits:
+        return []
+
+    # 5) 공고 메타 채우기 (한 번의 쿼리)
+    info_map = fetch_bid_info([h.bid_id for h in hits])
+    return [RecommendedBid(hit=h, info=info_map.get(h.bid_id)) for h in hits]
