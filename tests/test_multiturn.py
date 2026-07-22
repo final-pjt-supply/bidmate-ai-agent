@@ -197,3 +197,51 @@ def test_redirect_passes_context_through_with_pending_cleared(monkeypatch):
     assert resp.redirect_filters.region == Region.SEOUL
     assert resp.session_context.last_bid_ids == ["R001"]   # 통과
     assert resp.session_context.pending is None            # 단 pending은 리셋
+
+
+def test_three_turn_context_chain(monkeypatch):
+    """T1(clarify) → T2(대전, inherit) → T3(마감 임박, inherit) — 각 턴은
+    이전 턴이 '반환한' session_context를 그대로 다음 run_agent에 먹인다
+    (손으로 만든 컨텍스트 없음)."""
+    # T1 — "전기공사 공고 찾아줘" → 지역을 되물음
+    _mock_llm(monkeypatch, dict(
+        type="full", action="clarify", scope="new", entry_bid_scope="keep",
+        new_filters={"category": "전기공사"}, normalized_query="전기공사 공고",
+        clarify_message="어느 지역의 공고를 찾으시나요?"))
+    req1 = AgentRequest(query="전기공사 공고 찾아줘", company_id="c1",
+                        entry_context=EntryContext())
+    resp1 = run_agent(req1)
+    assert resp1.action == "clarify"
+    ctx1 = resp1.session_context
+    assert ctx1.pending is not None
+    assert ctx1.pending.partial_filters.category == "전기공사"
+
+    # T2 — "대전이요" → clarify 이어받아 답변, bid_ids 확보
+    _mock_llm(monkeypatch, dict(
+        type="full", action="answer", scope="inherit", entry_bid_scope="keep",
+        new_filters={"region": "대전"}, normalized_query="대전 전기공사",
+        clarify_message=None))
+    req2 = AgentRequest(query="대전이요", company_id="c1",
+                        entry_context=EntryContext(), session_context=ctx1)
+    resp2 = run_agent(req2)
+    assert resp2.action == "answer"
+    ctx2 = resp2.session_context
+    assert ctx2.pending is None
+    assert ctx2.last_filters.category == "전기공사"
+    assert ctx2.last_filters.region == Region.DAEJEON
+    assert ctx2.last_bid_ids
+
+    # T3 — "그중 마감 임박한 것만" → inherit, 신규 키만 추가 → 스코프(bid_ids) 고정
+    _mock_llm(monkeypatch, dict(
+        type="full", action="answer", scope="inherit", entry_bid_scope="keep",
+        new_filters={"deadline_within_days": 7}, normalized_query="마감 임박 전기공사",
+        clarify_message=None))
+    req3 = AgentRequest(query="그중 마감 임박한 것만", company_id="c1",
+                        entry_context=EntryContext(), session_context=ctx2)
+    resp3 = run_agent(req3)
+    assert resp3.action == "answer"
+
+    # resolve_filters를 직접 호출해 T3가 실제로 T2의 bid_ids 스코프에 갇혀
+    # 검색됐는지(신규 키 추가는 이탈이 아님) 확인.
+    intent3 = _intent(new_filters=Filters(deadline_within_days=7))
+    assert resolve_filters(req3, intent3)["bid_ids"] == ctx2.last_bid_ids
