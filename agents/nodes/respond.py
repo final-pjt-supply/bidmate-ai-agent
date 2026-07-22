@@ -41,9 +41,26 @@ def _chunks_block(state) -> str:
 
 
 def check_grounding(answer: str, signals: str) -> list[str]:
-    """답변의 수치가 신호에 없으면 위반 목록으로 반환."""
-    signal_nums = set(_NUM_RE.findall(signals))
-    return [n for n in _NUM_RE.findall(answer) if n not in signal_nums]
+    """답변의 수치가 신호에 없으면 위반 목록으로 반환.
+
+    신호 토큰은 날짜(2024.07.22)·천단위 콤마(10,000,000)처럼 여러 구획이
+    하나의 정규식 토큰으로 묶인다. 답변이 그 구획 일부나 콤마 제거형(정규화)을
+    인용해도 그라운딩 위반으로 보지 않도록, 허용 집합을 원본 토큰 ∪ 콤마 제거형
+    ∪ `[.,]` 분해 구획으로 넓힌다. 단, 토큰 전체의 마침표 제거는 하지 않는다
+    (그러면 "2.5"가 "25"와 같아져 서로 다른 값이 섞인다).
+    """
+    signal_tokens = _NUM_RE.findall(signals)
+    allowed = set(signal_tokens)
+    for tok in signal_tokens:
+        allowed.add(tok.replace(",", ""))
+        allowed.update(re.split(r"[.,]", tok))
+
+    violations = []
+    for tok in _NUM_RE.findall(answer):
+        if tok in allowed or tok.replace(",", "") in allowed:
+            continue
+        violations.append(tok)
+    return violations
 
 
 def build_summary(state) -> str:

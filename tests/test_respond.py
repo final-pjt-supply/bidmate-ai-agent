@@ -54,3 +54,15 @@ def test_build_summary_is_deterministic():
     s = _state()
     assert build_summary(s) == build_summary(s)
     assert "1건" in build_summary(s) or "건" in build_summary(s)
+
+
+def test_grounding_allows_date_and_comma_number_parts():
+    signals = "마감일 2026.08.01, 추정가격 1,200,000,000원"
+    answer = "08월 01일 마감이며 추정가격은 1200000000원입니다"
+    assert check_grounding(answer, signals) == []
+
+
+def test_grounding_still_flags_unrelated_numbers():
+    signals = "마감일 2026.08.01"
+    violations = check_grounding("통과 확률은 93%입니다", signals)
+    assert "93" in " ".join(violations)
