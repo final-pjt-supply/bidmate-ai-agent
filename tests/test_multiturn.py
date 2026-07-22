@@ -1,4 +1,7 @@
+import agents.nodes.router as router_mod
+from agents.llm import ModelTier
 from agents.merge import resolve_filters
+from agents.run import run_agent
 from agents.schemas import (
     AgentRequest, EntryContext, Filters, PendingClarify, QueryIntent,
     Region, SessionContext,
@@ -114,3 +117,83 @@ def test_polluted_prev_bid_ids_cannot_survive_scope_release():
                           _intent(new_filters=Filters(region=Region.SEOUL)))
     assert out["region"] == "서울"
     assert "bid_ids" not in out
+
+
+# ---- run_agent E2E (LLM은 monkeypatch) ----
+
+def _mock_llm(monkeypatch, router_payload,
+              respond_text="여유율 2.5배로 자격을 충족합니다."):
+    """router·respond 둘 다 같은 agents.llm 모듈을 쓰므로 patch는 하나만 —
+    두 번 걸면 마지막 것이 이겨서 Router가 산문을 받아 ValidationError가 난다.
+    티어로 분기해 ROUTER=dict, SYNTHESIS=str을 돌려준다."""
+    def fake_invoke(tier, messages, system=None, max_tokens=1024,
+                    output_schema=None):
+        return router_payload if tier == ModelTier.ROUTER else respond_text
+    monkeypatch.setattr(router_mod.llm, "invoke", fake_invoke)
+
+
+def test_answer_returns_updated_context(monkeypatch):
+    _mock_llm(monkeypatch, dict(
+        type="full", action="answer", scope="new", entry_bid_scope="keep",
+        new_filters={"region": "대전"}, normalized_query="대전 공고",
+        clarify_message=None))
+    resp = run_agent(AgentRequest(query="대전 공고", company_id="c1",
+                                  entry_context=EntryContext()))
+    assert resp.action == "answer"
+    assert resp.answer
+    ctx = resp.session_context
+    assert ctx.pending is None
+    assert ctx.last_filters.region == Region.DAEJEON
+    assert ctx.last_filters.bid_ids is None       # 스코프는 last_filters에 안 실림
+    assert ctx.last_bid_ids                       # 다룬 공고 기록
+    assert len(ctx.last_bid_ids) <= 20            # 상한
+
+
+def test_clarify_sets_pending(monkeypatch):
+    _mock_llm(monkeypatch, dict(
+        type="full", action="clarify", scope="new", entry_bid_scope="keep",
+        new_filters={"category": "전기공사"}, normalized_query="전기공사",
+        clarify_message="어느 지역의 공고를 찾으시나요?"))
+    resp = run_agent(AgentRequest(query="전기공사 공고 찾아줘",
+                                  company_id="c1",
+                                  entry_context=EntryContext()))
+    assert resp.action == "clarify"
+    assert resp.clarify_message == "어느 지역의 공고를 찾으시나요?"
+    p = resp.session_context.pending
+    assert p.original_query == "전기공사 공고 찾아줘"
+    assert p.partial_filters.category == "전기공사"
+
+
+def test_pending_reset_after_consumption(monkeypatch):
+    # clarify → "대전이요"(answer) → 반환 컨텍스트의 pending은 None
+    _mock_llm(monkeypatch, dict(
+        type="full", action="answer", scope="inherit", entry_bid_scope="keep",
+        new_filters={"region": "대전"}, normalized_query="대전 전기공사",
+        clarify_message=None))
+    ctx = SessionContext(
+        last_bid_ids=[], last_summary="지역을 되물음", last_filters=Filters(),
+        pending=PendingClarify(original_query="전기공사 공고 찾아줘",
+                               partial_filters=Filters(category="전기공사")))
+    resp = run_agent(AgentRequest(query="대전이요", company_id="c1",
+                                  entry_context=EntryContext(),
+                                  session_context=ctx))
+    assert resp.session_context.pending is None   # 소비 후 리셋
+    assert resp.session_context.last_filters.category == "전기공사"  # 병합됨
+
+
+def test_redirect_passes_context_through_with_pending_cleared(monkeypatch):
+    _mock_llm(monkeypatch, dict(
+        type="full", action="redirect", scope="new", entry_bid_scope="keep",
+        new_filters={"region": "서울"}, normalized_query="서울 공고 추천",
+        clarify_message=None))
+    ctx = SessionContext(
+        last_bid_ids=["R001"], last_summary="대전 5건",
+        last_filters=Filters(region=Region.DAEJEON),
+        pending=PendingClarify(original_query="q", partial_filters=Filters()))
+    resp = run_agent(AgentRequest(query="추천해줘", company_id="c1",
+                                  entry_context=EntryContext(),
+                                  session_context=ctx))
+    assert resp.action == "redirect"
+    assert resp.redirect_filters.region == Region.SEOUL
+    assert resp.session_context.last_bid_ids == ["R001"]   # 통과
+    assert resp.session_context.pending is None            # 단 pending은 리셋
