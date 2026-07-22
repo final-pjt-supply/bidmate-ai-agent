@@ -9,6 +9,7 @@
     /search <질의>       청크 단위 RAG 검색 (근거 원문 확인)
     /rec <질의>          추천 목록 (명시적)
     /set <키> <값>       옵션 변경 (top_k, open, ord)
+    /stats               유효 공고 수 확인 (데이터 진단)
     /help                도움말
     /quit                종료
 
@@ -22,6 +23,7 @@ from __future__ import annotations
 import sys
 import traceback
 
+from agents.tools.bid_info import open_bid_ids
 from agents.tools.search import recommend_bids, search_bids
 
 OPTS = {
@@ -91,6 +93,19 @@ def cmd_recommend(query: str) -> None:
         print(f"      {info.bid_id} | 걸린 청크 {r.hit.matched_chunks}개")
 
 
+def cmd_stats() -> None:
+    """데이터 진단: 업무구분별 유효 공고 수."""
+    print("\n[데이터 진단] 마감 전 + 최신 차수 공고 수")
+    print("-" * 70)
+    total = len(open_bid_ids())
+    print(f"  전체      {total:>6,}건")
+    for code, name in CATEGORY_NAMES.items():
+        n = len(open_bid_ids(category=code))
+        print(f"  {name:<8} {n:>6,}건")
+    if total == 0:
+        print("\n  유효 공고가 없습니다. bid_table의 마감일시를 확인하세요.")
+
+
 def cmd_set(args: list[str]) -> None:
     if len(args) < 2:
         print(f"  현재 옵션: {OPTS}")
@@ -139,6 +154,8 @@ def main() -> None:
                     cmd_recommend(" ".join(args))
                 elif cmd == "set":
                     cmd_set(args)
+                elif cmd == "stats":
+                    cmd_stats()
                 else:
                     print(f"  알 수 없는 명령: /{cmd} (/help 참고)")
             else:
