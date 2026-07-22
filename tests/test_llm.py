@@ -96,3 +96,29 @@ def test_invoke_prepares_query_intent_schema_for_bedrock(monkeypatch):
     body = json.loads(client.invoke_model.call_args.kwargs["body"])
     schema = body["output_config"]["format"]["schema"]
     _assert_bedrock_compatible(schema)
+
+
+def test_retry_on_read_timeout(monkeypatch, caplog):
+    from botocore.exceptions import ReadTimeoutError
+    err = ReadTimeoutError(endpoint_url="https://example.com")
+    client = MagicMock()
+    client.invoke_model.side_effect = [err, _fake_response("ok")]
+    monkeypatch.setattr(llm, "_client", lambda: client)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+
+    out = llm.invoke(ModelTier.ROUTER, [{"role": "user", "content": "hi"}])
+    assert out == "ok"
+    assert any("retry" in r.message and "ReadTimeoutError" in r.message
+               for r in caplog.records if r.levelname == "WARNING")
+
+
+def test_invoke_raises_when_no_text_block(monkeypatch):
+    client = MagicMock()
+    body = MagicMock()
+    body.read.return_value = json.dumps(
+        {"content": [{"type": "tool_use", "input": {}}]}).encode()
+    client.invoke_model.return_value = {"body": body}
+    monkeypatch.setattr(llm, "_client", lambda: client)
+
+    with pytest.raises(ValueError, match="text 블록이 없습니다"):
+        llm.invoke(ModelTier.ROUTER, [{"role": "user", "content": "hi"}])

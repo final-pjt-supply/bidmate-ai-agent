@@ -10,7 +10,7 @@ from functools import lru_cache
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -85,13 +85,24 @@ def invoke(tier: ModelTier, messages: list[dict], system: str | None = None,
             resp = _client().invoke_model(
                 modelId=_MODEL_IDS[tier], body=json.dumps(body))
             payload = json.loads(resp["body"].read())
-            text = next(b["text"] for b in payload["content"]
-                        if b["type"] == "text")
+            text = next((b["text"] for b in payload["content"]
+                        if b["type"] == "text"), None)
+            if text is None:
+                raise ValueError(
+                    "Bedrock 응답에 text 블록이 없습니다 (content types=%s)"
+                    % [b.get("type") for b in payload["content"]])
             return json.loads(text) if output_schema else text
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
+        except (ClientError, ReadTimeoutError) as e:
             ms = (time.monotonic() - start) * 1000
-            if code not in _RETRYABLE or attempt == _MAX_ATTEMPTS:
+            if isinstance(e, ClientError):
+                code = e.response["Error"]["Code"]
+                if code not in _RETRYABLE:
+                    raise
+            else:
+                code = "ReadTimeoutError"
+            if attempt == _MAX_ATTEMPTS:
+                logger.warning("llm retry exhausted attempts=%d code=%s",
+                               attempt, code)
                 raise
             delay = min(2 ** attempt + random.random(), 20)
             logger.warning("llm retry attempt=%d code=%s latency_ms=%.0f "
