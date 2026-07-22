@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     default_top_k: int = Field(10, alias="DEFAULT_TOP_K")
     knn_weight: float = Field(0.5, alias="KNN_WEIGHT")      # 벡터 가중치
     bm25_weight: float = Field(0.5, alias="BM25_WEIGHT")    # 키워드 가중치
+    # True면 정규화 하이브리드(임시 search pipeline), False면 bool 병합
+    use_normalization: bool = Field(True, alias="USE_NORMALIZATION")
+    # knn이 뽑을 후보 수 = top_k * 이 배수.
+    # 값이 작으면 knn/BM25 두 결과의 겹침이 적어 점수가 0.5에 몰린다
+    # (한쪽 목록에만 있는 문서는 다른 쪽 기여가 0이 되기 때문).
+    knn_candidate_multiplier: int = Field(20, alias="KNN_CANDIDATE_MULTIPLIER")
 
     @property
     def pg_dsn(self) -> str:

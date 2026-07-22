@@ -20,8 +20,9 @@ from agents.clients.opensearch import get_client
 from agents.config import get_settings
 from agents.schemas import BidHit, BidSearchResult, Chunk, RecommendedBid, SearchResult
 
-# knn 후보 폭. top_k보다 넉넉히 잡아야 병합 후 상위 정렬이 안정적이다.
-_KNN_CANDIDATE_MULTIPLIER = 5
+# knn 후보 폭의 기본 배수는 config(KNN_CANDIDATE_MULTIPLIER)에서 읽는다.
+# 정규화 하이브리드에서는 이 값이 중요하다: 후보가 적으면 knn 결과와 BM25 결과의
+# 겹침이 적어져, 한쪽에만 걸린 문서가 많아지고 점수가 0.5 부근에 몰린다.
 
 # 공고 단위 검색 시, 중복 제거로 개수가 줄어드는 것을 감안해
 # 목표 공고 수의 몇 배만큼 청크를 미리 뽑을지.
@@ -29,6 +30,26 @@ _DEDUPE_OVERFETCH = 3
 
 # 추천 시 마감·차수 필터로 걸러질 것을 감안한 추가 여유분.
 _RECOMMEND_OVERFETCH = 3
+
+# 정규화 하이브리드용 임시 search pipeline.
+# 클러스터에 등록하지 않고 요청 본문에 실어 보내므로 쓰기 권한이 필요 없다.
+# min_max로 BM25/knn 점수를 각각 0~1로 정규화한 뒤 가중 산술평균으로 합친다.
+# (bool 방식은 두 점수를 그대로 더해서 스케일이 큰 BM25가 결과를 지배한다)
+def _normalization_pipeline(knn_weight: float, bm25_weight: float) -> dict:
+    return {
+        "phase_results_processors": [
+            {
+                "normalization-processor": {
+                    "normalization": {"technique": "min_max"},
+                    "combination": {
+                        "technique": "arithmetic_mean",
+                        # 가중치 순서는 hybrid.queries 순서와 일치해야 한다
+                        "parameters": {"weights": [knn_weight, bm25_weight]},
+                    },
+                }
+            }
+        ]
+    }
 
 
 def _build_query(
@@ -40,6 +61,7 @@ def _build_query(
     size: int,
     knn_weight: float,
     bm25_weight: float,
+    knn_k: int,
 ) -> dict:
     """벡터 + 키워드를 bool.should 로 병합한 OpenSearch 쿼리 본문을 만든다."""
     filters: list[dict] = []
@@ -52,7 +74,7 @@ def _build_query(
         "knn": {
             "vector": {
                 "vector": vector,
-                "k": size * _KNN_CANDIDATE_MULTIPLIER,
+                "k": knn_k,
                 "boost": knn_weight,
                 **({"filter": {"bool": {"filter": filters}}} if filters else {}),
             }
@@ -82,6 +104,51 @@ def _build_query(
     }
 
 
+def _build_hybrid_query(
+    *,
+    text: str,
+    vector: list[float],
+    bid_ids: list[str] | None,
+    types: list[str] | None,
+    size: int,
+    knn_weight: float,
+    bm25_weight: float,
+    knn_k: int,
+) -> dict:
+    """정규화 하이브리드 쿼리 본문을 만든다.
+
+    bool 방식과 달리 두 점수를 각각 min-max 정규화한 뒤 합치므로,
+    BM25(0~수십)와 knn 코사인(0~2)의 스케일 차이가 사라진다.
+    """
+    filters: list[dict] = []
+    if bid_ids:
+        filters.append({"terms": {"bid_id": bid_ids}})
+    if types:
+        filters.append({"terms": {"type": types}})
+
+    knn_inner: dict = {
+        "vector": vector,
+        "k": knn_k,
+    }
+    if filters:
+        knn_inner["filter"] = {"bool": {"filter": filters}}
+    knn_clause = {"knn": {"vector": knn_inner}}
+
+    match_clause: dict = {"match": {"text": {"query": text}}}
+    if filters:
+        bm25_clause: dict = {"bool": {"must": [match_clause], "filter": filters}}
+    else:
+        bm25_clause = match_clause
+
+    return {
+        "size": size,
+        # queries 순서가 pipeline weights 순서와 대응한다 (knn, bm25)
+        "query": {"hybrid": {"queries": [knn_clause, bm25_clause]}},
+        "_source": {"excludes": ["vector"]},
+        "search_pipeline": _normalization_pipeline(knn_weight, bm25_weight),
+    }
+
+
 def _to_chunk(hit: dict) -> Chunk:
     src = hit["_source"]
     return Chunk(
@@ -103,14 +170,23 @@ def _run_search(
     types: list[str] | None,
     knn_weight: float | None,
     bm25_weight: float | None,
+    normalize: bool | None = None,
+    knn_multiplier: int | None = None,
 ) -> tuple[list[Chunk], int]:
-    """공통 검색 실행부. (청크 리스트, 전체 매칭 수)를 반환한다."""
+    """공통 검색 실행부. (청크 리스트, 전체 매칭 수)를 반환한다.
+
+    normalize=True면 정규화 하이브리드(임시 pipeline), False면 bool 병합.
+    None이면 설정 기본값(USE_NORMALIZATION)을 따른다.
+    """
     s = get_settings()
     knn_weight = s.knn_weight if knn_weight is None else knn_weight
     bm25_weight = s.bm25_weight if bm25_weight is None else bm25_weight
+    normalize = s.use_normalization if normalize is None else normalize
+    mult = s.knn_candidate_multiplier if knn_multiplier is None else knn_multiplier
 
     vector = embed_query(query)
-    body = _build_query(
+    builder = _build_hybrid_query if normalize else _build_query
+    body = builder(
         text=query,
         vector=vector,
         bid_ids=bid_ids,
@@ -118,6 +194,7 @@ def _run_search(
         size=size,
         knn_weight=knn_weight,
         bm25_weight=bm25_weight,
+        knn_k=size * mult,
     )
     resp = get_client().search(index=s.opensearch_index, body=body)
 
@@ -136,6 +213,8 @@ def search_bids(
     top_k: int | None = None,
     knn_weight: float | None = None,
     bm25_weight: float | None = None,
+    normalize: bool | None = None,
+    knn_multiplier: int | None = None,
 ) -> SearchResult:
     """청크 단위 하이브리드 검색 (챗봇 RAG용).
 
@@ -164,6 +243,8 @@ def search_bids(
         types=types,
         knn_weight=knn_weight,
         bm25_weight=bm25_weight,
+        normalize=normalize,
+        knn_multiplier=knn_multiplier,
     )
     return SearchResult(query=query, chunks=chunks, total_hits=total_hits)
 
@@ -198,6 +279,8 @@ def search_bids_grouped(
     top_k: int | None = None,
     knn_weight: float | None = None,
     bm25_weight: float | None = None,
+    normalize: bool | None = None,
+    knn_multiplier: int | None = None,
 ) -> BidSearchResult:
     """공고 단위 하이브리드 검색 (추천 목록용).
 
@@ -229,6 +312,8 @@ def search_bids_grouped(
         types=types,
         knn_weight=knn_weight,
         bm25_weight=bm25_weight,
+        normalize=normalize,
+        knn_multiplier=knn_multiplier,
     )
 
     bids = _dedupe_by_bid(chunks)[:top_k]
@@ -240,29 +325,34 @@ def recommend_bids(
     *,
     top_k: int | None = None,
     types: list[str] | None = None,
+    category: str | None = None,
     only_open: bool = True,
     latest_ord_only: bool = True,
 ) -> list[RecommendedBid]:
     """추천 공고 목록을 만든다: 검색(OpenSearch) + 공고 정보(PostgreSQL).
 
     흐름
-      1) 하이브리드 검색으로 관련 청크를 넉넉히 뽑는다
-      2) bid_id 기준 중복 제거 (공고당 1건)
-      3) 마감 지난 공고 제외 (only_open)
-      4) 재공고 차수가 옛것이면 제외 (latest_ord_only)
-      5) bid_table에서 공고명·기관·마감일 등을 채운다
+      1) PostgreSQL에서 유효 공고(마감 전 + 최신 차수) bid_id 목록을 먼저 구한다
+      2) 그 목록을 필터로 넘겨 하이브리드 검색 → 버려지는 결과가 없다
+      3) bid_id 기준 중복 제거 (공고당 1건)
+      4) bid_table에서 공고명·기관·마감일 등을 채운다
+
+    1번을 먼저 하는 이유: 색인된 공고 상당수가 이미 마감된 상태라,
+    "검색 후 걸러내기" 방식은 후보 대부분이 탈락해 결과가 빈약해진다.
+    (실측 생존율 약 10%)
 
     Args:
         query: 사용자 질의.
         top_k: 반환할 공고 수. None이면 설정 기본값.
         types: 청크 종류 필터.
+        category: 업무구분 필터 (cnstwk/servc/thng/frgcpt).
         only_open: True면 마감 지난 공고를 제외한다.
         latest_ord_only: True면 같은 공고번호 중 최신 차수만 남긴다.
 
     Returns:
         RecommendedBid 목록 (검색 점수 내림차순).
     """
-    from agents.tools.bid_info import fetch_bid_info, filter_open_bids, latest_ord_map
+    from agents.tools.bid_info import fetch_bid_info, open_bid_ids
 
     query = (query or "").strip()
     if not query:
@@ -270,23 +360,28 @@ def recommend_bids(
 
     top_k = top_k or get_settings().default_top_k
 
-    # 1~2) 필터로 걸러질 것을 감안해 넉넉히 뽑는다
+    # 1) 검색 대상을 유효 공고로 미리 좁힌다
+    allowed: list[str] | None = None
+    if only_open or category:
+        allowed = open_bid_ids(category=category)
+        if not allowed:
+            return []
+
+    # 2) 좁혀진 범위에서 검색 (여유분은 청크 중복 제거용으로만 필요)
     search_result = search_bids_grouped(
-        query, types=types, top_k=top_k * _RECOMMEND_OVERFETCH
+        query,
+        bid_ids=allowed,
+        types=types,
+        top_k=top_k * _RECOMMEND_OVERFETCH,
     )
     hits = search_result.bids
     if not hits:
         return []
 
-    bid_ids = [h.bid_id for h in hits]
+    # 3) 사전 필터를 안 쓴 경우에만 사후 차수 필터를 적용
+    if latest_ord_only and allowed is None:
+        from agents.tools.bid_info import latest_ord_map
 
-    # 3) 마감 전인 것만
-    if only_open:
-        open_ids = filter_open_bids(bid_ids)
-        hits = [h for h in hits if h.bid_id in open_ids]
-
-    # 4) 최신 차수만 (테이블 기준으로 판단)
-    if latest_ord_only and hits:
         latest = set(latest_ord_map([h.bid_id for h in hits]).values())
         hits = [h for h in hits if h.bid_id in latest]
 
@@ -294,6 +389,6 @@ def recommend_bids(
     if not hits:
         return []
 
-    # 5) 공고 메타 채우기 (한 번의 쿼리)
+    # 4) 공고 메타 채우기 (한 번의 쿼리)
     info_map = fetch_bid_info([h.bid_id for h in hits])
     return [RecommendedBid(hit=h, info=info_map.get(h.bid_id)) for h in hits]

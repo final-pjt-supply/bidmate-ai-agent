@@ -105,3 +105,43 @@ def filter_open_bids(bid_ids: list[str]) -> set[str]:
     with get_cursor() as cur:
         cur.execute(sql, (bid_ids,))
         return {row["bid_id"] for row in cur.fetchall()}
+
+
+def open_bid_ids(
+    *,
+    category: str | None = None,
+    limit: int = 20000,
+) -> list[str]:
+    """현재 유효한 공고(마감 전 + 최신 차수)의 bid_id 목록을 가져온다.
+
+    검색 전에 이 목록을 구해 OpenSearch의 bid_id 필터로 넘기면,
+    "검색 후 걸러내기"에서 대부분이 탈락하는 낭비를 없앨 수 있다.
+
+    마감 판정은 KST naive 기준(AT TIME ZONE)으로 하며,
+    같은 공고번호 중에서는 가장 큰 차수 1건만 남긴다.
+
+    Args:
+        category: 업무구분 필터 (cnstwk/servc/thng/frgcpt).
+        limit: 최대 개수. OpenSearch terms 필터 크기를 제한하기 위한 안전장치.
+
+    Returns:
+        bid_id 문자열 리스트.
+    """
+    where = ["(bid_clse_dt IS NULL OR bid_clse_dt > (NOW() AT TIME ZONE 'Asia/Seoul'))"]
+    params: list[object] = []
+    if category:
+        where.append("bid_category = %s")
+        params.append(category)
+
+    sql = f"""
+        SELECT DISTINCT ON (bid_ntce_no) bid_id
+        FROM bid_table
+        WHERE {' AND '.join(where)}
+        ORDER BY bid_ntce_no, bid_ntce_ord DESC
+        LIMIT %s
+    """
+    params.append(limit)
+
+    with get_cursor() as cur:
+        cur.execute(sql, params)
+        return [row["bid_id"] for row in cur.fetchall()]
