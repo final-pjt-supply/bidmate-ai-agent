@@ -1,426 +1,369 @@
-"""BidMate 정규화 분해기 v1 — name_raw → 표준 코드 (P2 Stage 1)
+"""
+normalize_output_adapter.py — 정규화 출력 어댑터 (v2.4)
+=======================================================
 
-순수 함수 모듈: DB 접속 없음. 조회 자료(별칭·마스터)는 LookupContext로 주입한다.
-규칙 순서와 근거: 2026-07-21 커버리지 검수 실측 (작업일지 참조)
-  ⓪ 내장 코드 추출(+42.7%p 실증) → ① 구두점·공백 통일 → ② 접미사 제거
-  → ③ OR 분해 → ④ 무시 목록 → ⑤ 특수/라우팅
+역할: bid_table(원본, LLM 추출 v0.2 + API 정형 v0.1)을 읽어, normalizer 순수 함수로
+      해석한 결과를 v2.4 스키마의 bid_qual_* 11개 테이블에 **행으로 적재**한다.
 
-배치 러너 사용법:
-    ctx = LookupContext(alias=..., license_codes=..., item_codes=..., item_names=...)
-    r = normalize_license("토목(또는 토목건축)공사업 등록", ctx)
-    # r.codes == ['0001','0003'] (or_group), r.method == 'rule+alias'
+구 어댑터(jsonb *_norm UPDATE)를 폐기하고 전면 재작성:
+  · 쓰기부 = "행 INSERT + 마스터 조인으로 표준명 채움"  (구: jsonb UPDATE)
+  · 공고 단위 DELETE→INSERT 멱등 트랜잭션
+  · v2.4 반영: 규모→bid_qual_size / 신용→bid_qual_credit / 직생→bid_qual_items,
+              지명경쟁·공동수급은 summary 표시전용(매칭 미참여)
+  · 실적·시공능력 파싱, 인증 라우팅(직생·규모 서류 혼입 배제)은 이 어댑터 소관(신규)
+
+normalizer 순수 함수(v1.5, 3개 v1.6 버그는 normalizer 쪽에서 흡수)는 그대로 재사용.
+아래 Normalizer 프로토콜에 실제 normalizer.py를 주입한다(테스트는 mock 주입).
+
+  · canon_key(s)                         -> str
+  · normalize_license(name_raw)          -> list[dict{or_group, code, method, qualifier, source}]
+  · normalize_region(name_raw, site_rgn) -> dict{code, method, flag}
+  · normalize_personnel(field,grade,cnt) -> dict{qual_code, method, role_field, headcount, grade_raw}
+  · normalize_item(raw)                  -> dict{item_code, method, source}
+
+DB: psycopg(v3). 실행: python normalize_output_adapter.py  (기본 DRY_RUN=True)
 """
 from __future__ import annotations
-
-import re
+import os, re, json, logging
 from dataclasses import dataclass, field
+from typing import Protocol, Any
+
+log = logging.getLogger("normalize_adapter")
+
+NORMALIZER_VERSION = "v1.6"   # summary.normalizer_version — 재정규화 레버
+
+# ─────────────────────────────────────────────────────────────
+# 상수 (어댑터 소관 규칙)
+# ─────────────────────────────────────────────────────────────
+PERF_UNIT_WHITELIST = {"원", "건"}                       # 실적 unit 화이트리스트 (그 외 → 확인필요)
+SIZE_ENUM = {"sme_only", "small_only", "no_large", "no_conglomerate"}  # 'none'은 요구 아님
+
+# 인증 라우팅/무시: required_certs에 혼입된 비(非)인증 서류를 걸러낸다 (cert 매칭 전).
+CERT_ROUTE_DIRECT = ("직접생산", "직생")                 # → 품목 축 직생으로 (이미 direct_production_req로 처리)
+CERT_ROUTE_SIZE   = ("중소기업확인", "중소기업제품", "소기업확인")  # → 규모 축
+CERT_IGNORE       = ("여성기업", "장애인기업", "사회적기업",      # 우대(가점) — v1 제외
+                     "공장등록", "사업자등록", "납세증명", "국세완납", "지방세완납")
+
+# 실적 basis에서 집계 방식 판정
+_AGG_SUM   = ("누계", "합산", "합계", "총")
+_AGG_COUNT = ("건 이상", "건이상", "회 이상", "횟수")
 
 
-# ────────────────────────────────────────────────
-# 조회 컨텍스트 — 배치 러너가 DB에서 1회 로드해 주입
-# ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# normalizer 인터페이스
+# ─────────────────────────────────────────────────────────────
+class Normalizer(Protocol):
+    def canon_key(self, s: str) -> str: ...
+    def normalize_license(self, name_raw: str) -> list[dict]: ...
+    def normalize_region(self, name_raw: str, site_rgn: str | None = None) -> dict: ...
+    def normalize_personnel(self, field: str | None, grade: str | None, count: Any) -> dict: ...
+    def normalize_item(self, raw: str) -> dict: ...
+
+
 @dataclass
-class LookupContext:
-    alias: dict            # {(entity_type, alias_text): canonical_code}
-    license_codes: set     # license_master.license_code 전체 (⚠️ is_active 필터 없이 로드 — 폐지 업종 해석 허용)
-    item_codes: set        # item_code_master.item_code 전체
-    item_names: dict       # {item_name: item_code}  (물품 이름 역매핑용)
+class MasterNames:
+    """표준명 병기용 — 코드→이름 캐시 (한 번 로드)."""
+    license: dict[str, str] = field(default_factory=dict)
+    region: dict[str, str] = field(default_factory=dict)
+    personnel: dict[str, str] = field(default_factory=dict)
+    item: dict[str, str] = field(default_factory=dict)
+    cert: dict[str, str] = field(default_factory=dict)
+    cert_alias: dict[str, str] = field(default_factory=dict)  # canon_key(별칭) → cert_code
 
-    def __post_init__(self):
-        # v1.5: 별칭 키를 canon_key로 정규화 — 조회 텍스트와 같은 변환을 양쪽에 적용
-        #       (DB 공식명의 ㆍ/․/쉼표/공백이 조회 측 변환과 어긋나던 비대칭 버그 수정)
-        self.alias = {(e, canon_key(t)): c for (e, t), c in self.alias.items()}
-        self.item_names = {canon_key(n): c for n, c in self.item_names.items()}
-
-    def find(self, entity: str, text: str):
-        return self.alias.get((entity, canon_key(text)))
-
-
-@dataclass
-class Result:
-    codes: list = field(default_factory=list)  # 확정 코드 (OR 관계면 복수 — 하나라도 보유 시 충족)
-    method: str = "none"   # rule0 / alias / rule+alias / name_map / special:* / route:* / ignored / none
-    qualifier: str = ""    # 보존 한정조건 (예: 주력분야:기계설비공사)
-    raw: str = ""
-
-    @property
-    def matched(self) -> bool:
-        return bool(self.codes)
-
-
-# ────────────────────────────────────────────────
-# 공통 유틸 — 규칙 ①
-# ────────────────────────────────────────────────
-_PUNCT_MAP = str.maketrans({"․": "·", "･": "·", "・": "·", "ㆍ": "·", "｡": "·", "‧": "·"})
+    @classmethod
+    def load(cls, conn, norm: Normalizer) -> "MasterNames":
+        m = cls()
+        def rows(sql):
+            with conn.cursor() as c:
+                c.execute(sql); return c.fetchall()
+        m.license   = {k: v for k, v in rows("SELECT license_code, license_name FROM license_master")}
+        m.region    = {k: v for k, v in rows("SELECT region_code, region_name FROM region_master")}
+        m.personnel = {k: v for k, v in rows("SELECT qual_code, qual_name FROM personnel_grade_master")}
+        m.item      = {k: v for k, v in rows("SELECT item_code, item_name FROM item_code_master")}
+        m.cert      = {k: v for k, v in rows("SELECT cert_code, cert_name FROM cert_master")}
+        # cert 별칭 사전 (canon_key 대칭 적용)
+        for alias, code in rows("SELECT alias_text, canonical_code FROM master_alias WHERE entity_type='cert'"):
+            m.cert_alias[norm.canon_key(alias)] = code
+        # 인증명 자체도 canon_key로 조회 가능하게
+        for code, name in m.cert.items():
+            m.cert_alias.setdefault(norm.canon_key(name), code)
+            m.cert_alias.setdefault(norm.canon_key(code), code)
+        return m
 
 
-def _clean(text: str) -> str:
-    """구두점 통일 + 공백 축소."""
-    t = text.translate(_PUNCT_MAP)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# ─────────────────────────────────────────────────────────────
+# 어댑터 소관 파서 (신규 — normalizer 밖)
+# ─────────────────────────────────────────────────────────────
+def _num(v) -> float | None:
+    if v is None: return None
+    if isinstance(v, (int, float)): return float(v)
+    s = re.sub(r"[^\d.]", "", str(v))
+    return float(s) if s else None
 
+def parse_performance(req: dict) -> dict:
+    """실적 요구 1건 → bid_qual_performances 행. 미해석은 통과가 아니라 확인필요."""
+    unit_raw = (req.get("unit") or "")
+    basis    = (req.get("basis") or "")
+    unit = "원" if "원" in unit_raw else ("건" if "건" in unit_raw else None)
+    min_value = _num(req.get("value"))
+    if any(k in basis for k in _AGG_COUNT) or unit == "건":
+        agg = "count"
+    elif any(k in basis for k in _AGG_SUM):
+        agg = "sum"
+    else:
+        agg = "single"          # 기본: 단일 실적
+    yr = re.search(r"(\d+)\s*년", basis)
+    period_years = int(yr.group(1)) if yr else 5
+    parsed = unit in PERF_UNIT_WHITELIST and min_value is not None
+    return {
+        "parse_status": "parsed" if parsed else "unparsed",
+        "unit": unit if unit in PERF_UNIT_WHITELIST else None,
+        "min_value": min_value,
+        "agg_type": agg if parsed else None,
+        "period_years": period_years,
+        "field_code": None,     # 분야 해석은 v2 (category_raw 보존)
+        "category_raw": req.get("category"),
+        "basis_raw": basis or None,
+        "scope_raw": req.get("scope_raw"),
+    }
 
-def canon_key(text: str) -> str:
-    """v1.5: 별칭 조회용 정규화 키 — 구두점 통일 + 쉼표→· + 따옴표 제거 + 공백 전부 제거.
-    별칭 키(공식명)와 조회 텍스트 양쪽에 동일 적용해야 한다."""
-    t = _clean(str(text))
-    t = t.replace(",", "·").replace("‘", "").replace("’", "").replace("'", "")
-    return re.sub(r"\s+", "", t)
+def parse_capacity(req: dict, norm: Normalizer) -> dict:
+    """능력 요구 1건 → bid_qual_capacity 행 (시공능력평가액)."""
+    min_value = _num(req.get("value"))
+    lic = None
+    name = req.get("name") or ""
+    if name:                    # 업종명이 붙어 있으면 면허 정규화로 코드 시도
+        comps = norm.normalize_license(name)
+        for cpt in comps:
+            if cpt.get("code"):
+                lic = cpt["code"]; break
+    parsed = min_value is not None
+    return {
+        "capacity_type": "시공능력평가액",
+        "license_code": lic,
+        "min_value": int(min_value) if parsed else None,
+        "parse_status": "parsed" if parsed else "unparsed",
+        "name_raw": name or (req.get("unit") or "능력요건"),
+        "method": "rule0" if lic else "none",
+    }
 
-
-# ────────────────────────────────────────────────
-# 면허 (license)
-# ────────────────────────────────────────────────
-# 규칙 ⓪: 괄호 내 4자리 업종코드 — "(1468)", "(업종코드: 1169)", "(6202, 주력분야…)" (v1.3: 쉼표 종결 허용)
-_LIC_CODE_RE = re.compile(r"(?<![0-9])(\d{4})\s*[,)]")
-# v1.3: 단독 10자리 세부품명번호 내장 ("전기히트펌프(4010180601)") → item 라우팅
-_LIC_ITEM10_RE = re.compile(r"(?<![0-9])(\d{10})(?![0-9])")
-# 규칙 ②: 접미사 (긴 패턴 먼저)
-_LIC_SUFFIXES = [
-    re.compile(r"[을를]?\s*(?:입찰참가자격|참가자격)[을]?\s*등록(?:한\s*자)?$"),
-    re.compile(r"(?:으로|로)\s*입찰참가자격[을]?\s*등록(?:한\s*자)?$"),
-    re.compile(r"[을를]\s*등록한\s*(?:자|업체)$"),
-    re.compile(r"[을를]?\s*등록\s*(?:한\s*자|한\s*업체)?$"),          # v1.4: "~을 등록" 포함
-    re.compile(r"(?:으로|로)\s*등록(?:한\s*자)?$"),                   # v1.4: "~으로 등록한 자"
-    re.compile(r"(?:으로|로)\s*신고(?:를?\s*필한\s*자)?$"),           # v1.3: "~로 신고"
-    re.compile(r"[을를]?\s*개설\s*및\s*신고를?\s*필한\s*자$"),         # v1.4: 건축사사무소 개설·신고
-    re.compile(r"\s*업종$"),
-    re.compile(r"\s*면허$"),
-]
-# v1.4: 총칭 표기 → 공식 세부 업종들의 OR (identity 별칭 경유로 코드 해석 — 코드 하드코딩 금지)
-_LIC_UMBRELLA = {
-    "소프트웨어사업자": [
-        "소프트웨어사업자(패키지소프트웨어개발.공급사업)",
-        "소프트웨어사업자(컴퓨터관련서비스사업)",
-        "소프트웨어사업자(디지털콘텐츠개발서비스사업)",
-        "소프트웨어사업자(데이터베이스제작및검색서비스사업)",
-    ],
-}
-# 규칙 ④: 무시 목록 (면허가 아닌 것) — v1.2: 등록증·허가증·조합 등재 추가 (7/22 표본 검수)
-_LIC_IGNORE = re.compile(
-    r"확인서|증명서|고유번호|품질인증|입찰참가자격등록을 한 자|공급인증|성적서"
-    r"|등록증$|허가증$|조합공동사업|기업리스트|등재")
-# v1.2: 면허 필드에 혼입된 물품 참가자격 → item 도메인 라우팅
-_LIC_ITEM_REG = re.compile(r"물품으로\s*(?:의\s*)?입찰참가|제조(?:\s*또는\s*공급)?\s*물품")
-_LIC_ITEM_CODE = re.compile(r"(\d{10}|\d{8})")
-# v1.2: 접미사 제거 후 잔여가 총칭뿐이면 무시 (예: "공사업 등록 또는 면허")
-_LIC_GENERIC = {"공사업", "면허", "등록", "공사업 또는 면허"}
-# qualifier 보존: 괄호/대괄호 안 주력분야·분담이행 조항 (v1.5.1: 대괄호 안 중첩 괄호 허용)
-_LIC_QUALIFIER = re.compile(
-    r"\([^()]*(?:주력분야|분담이행)[^()]*\)"          # 괄호형: (주력분야:…)
-    r"|\[[^\[\]]*(?:주력분야|분담이행)[^\[\]]*\]")     # 대괄호형: [주력분야 : X(제1종)] — 내부 괄호 허용
-# v1.5: 문장형 주력분야 조항 — "~ 중 'X'를 주력분야로 등록(한 업체)(에 한함)"
-_LIC_MAINFIELD = re.compile(
-    r"\s*중?\s*['‘]?[^'’()\s]+['’]?[를을]?\s*주력분야로\s*등록(?:한\s*(?:자|업체))?(?:에\s*한함)?$")
-# v1.5: 소방 복합 (일반(기계 및 전기)) 또는 전문 — 보수적 근사: 전문소방시설공사업 단독 매핑
-_LIC_FIRE_COMPOSITE = re.compile(
-    r"일반소방시설공사업\s*\(\s*기계\s*및\s*전기[^)]*\)\s*또는\s*전문소방시설공사업")
-# "전문건설업 중 X" / "종합건설업 중 X" / "종합건설업(X)"
-_LIC_WRAPPER = [
-    (re.compile(r"^(?:전문건설업|종합건설업)\s*중\s*"), ""),
-    (re.compile(r"^종합건설업\((.+)\)$"), r"\1"),
-]
-
-
-def _lic_lookup(ctx: LookupContext, text: str):
-    """v1.5: canon_key가 양쪽에 적용되므로 단일 조회로 충분 (쉼표·구두점·공백 변형 흡수)."""
-    return ctx.find("license", text)
-
-
-def _strip_suffixes(text: str) -> str:
-    t = text
-    changed = True
-    while changed:
-        changed = False
-        for pat in _LIC_SUFFIXES:
-            new = pat.sub("", t).strip()
-            if new != t:
-                t, changed = new, True
-    return t
-
-
-def _split_or(text: str) -> list[str]:
-    """규칙 ③: OR 분해.
-    "토목(또는 토목건축)공사업" → ["토목공사업", "토목건축공사업"]
-    "A 또는 B" → ["A", "B"]  (괄호 밖 '또는'만 분리)
+def route_cert(name_raw: str, norm: Normalizer, mn: MasterNames) -> dict | None:
     """
-    m = re.match(r"^(.*?)\(또는\s*([^)]+)\)(.*)$", text)
-    if m:
-        head, alt, tail = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-        return [f"{head}{tail}", f"{alt}{tail}"]
-    # v1.5: 괄호 안 OR — "전기분야설계업(종합 또는 전문 1종)" → [X(종합), X(전문 1종)]
-    m = re.match(r"^(.+?)\(([^()]+?)\s*또는\s*([^()]+?)\)$", text)
-    if m:
-        head, a, b = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-        return [f"{head}({a})", f"{head}({b})"]
-    # 괄호 깊이 0에서의 " 또는 " 분리
-    parts, depth, buf = [], 0, ""
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-        if depth == 0 and text.startswith(" 또는 ", i):
-            parts.append(buf.strip())
-            buf = ""
-            i += len(" 또는 ")
-            continue
-        buf += ch
-        i += 1
-    parts.append(buf.strip())
-    return [p for p in parts if p]
+    required_certs 1건 처리.
+    반환 None = 인증 아님(라우팅/무시). dict = bid_qual_certs 행(코드 or 미해석).
+    """
+    s = str(name_raw)
+    if any(k in s for k in CERT_ROUTE_DIRECT):  return None  # 직생 → 품목 축(이미 처리)
+    if any(k in s for k in CERT_ROUTE_SIZE):    return None  # 규모 → 규모 축
+    if any(k in s for k in CERT_IGNORE):        return None  # 우대·일반서류 → 무시
+    code = mn.cert_alias.get(norm.canon_key(s))
+    return {
+        "cert_code": code,
+        "cert_name": mn.cert.get(code) if code else None,
+        "method": "alias" if code else "none",
+        "name_raw": s,
+    }
 
 
-def normalize_license(raw: str, ctx: LookupContext) -> Result:
-    r = Result(raw=raw)
-    if not raw or not raw.strip():
-        return r
-    text = _clean(raw).strip("[]")           # v1.3: 대괄호 래핑 제거
+# ─────────────────────────────────────────────────────────────
+# 행 빌더 (순수 — DB 안 건드림). bid_row(dict) → {table: [row dict, ...]}
+# ─────────────────────────────────────────────────────────────
+def build_rows(bid: dict, norm: Normalizer, mn: MasterNames) -> dict[str, list[dict]]:
+    no, ord_ = bid["bid_ntce_no"], bid["bid_ntce_ord"]
+    out: dict[str, list[dict]] = {t: [] for t in (
+        "summary", "licenses", "regions", "personnel", "items", "performances",
+        "certs", "capacity", "size", "credit", "region_duty")}
 
-    # ⓪ 내장 업종코드
-    m = _LIC_CODE_RE.search(text)
-    if m and m.group(1) in ctx.license_codes:
-        r.codes, r.method = [m.group(1)], "rule0"
-        return r
+    # ── 앵커 summary (스칼라 게이트 폐기 후: 지역기준·표시전용·신호·스코어링·메타) ──
+    out["summary"].append({
+        "bid_ntce_no": no, "bid_ntce_ord": ord_, "bid_category": bid["bid_category"],
+        "region_limit_type": bid.get("region_limit_type"),
+        "designated_competition": bid.get("dsgnt_cmpt_yn"),          # 표시전용
+        "joint_supply_method": bid.get("cmmn_spldmd_methd_nm"),       # 표시전용
+        "region_duty_joint_contract": bid.get("rgn_duty_jntcontrct_yn"),
+        "region_duty_rate": bid.get("rgn_duty_jntcontrct_rt"),
+        "joint_venture_allowed": bid.get("joint_venture_allowed"),
+        "subcontract_allowed": bid.get("subcontract_allowed"),
+        "award_cutline_type": bid.get("award_cutline_type"),
+        "award_cutline_value": bid.get("award_cutline_value"),
+        "tech_weight": bid.get("tech_weight"), "price_weight": bid.get("price_weight"),
+        "normalizer_version": NORMALIZER_VERSION,
+    })
 
-    # ⓪-b (v1.2) 물품 참가자격 혼입 → item 도메인 라우팅
-    if _LIC_ITEM_REG.search(text):
-        mc = _LIC_ITEM_CODE.search(text)
-        if mc:
-            r.codes, r.method = [mc.group(1)], "route:item"
-        else:
-            r.method = "ignored"
-        return r
-    # ⓪-c (v1.3) 단독 10자리 세부품명번호 내장 → item 라우팅
-    m10 = _LIC_ITEM10_RE.search(text)
-    if m10 and m10.group(1) in ctx.item_codes:
-        r.codes, r.method = [m10.group(1)], "route:item"
-        return r
+    # ── ① 면허 (OR 분해 → or_group별 다중 행) ──
+    #   normalizer는 문자열 1건 단위 순수함수라 or_group을 "1"부터 로컬 번호로 반환한다.
+    #   서로 다른 required_licenses 항목(=독립 AND 요구)이 같은 "1"로 충돌하면
+    #   매칭 쿼리(그룹 간 AND)가 이를 OR로 오인 → 요구 항목 인덱스로 네임스페이스.
+    #   결과: "A 또는 B"(한 항목) = 같은 그룹(OR), 항목이 다르면 다른 그룹(AND).
+    for req_idx, req in enumerate(bid.get("required_licenses") or [], start=1):
+        raw = req.get("name_raw") or ""
+        for cpt in norm.normalize_license(raw):
+            code = cpt.get("code")
+            out["licenses"].append({
+                "bid_ntce_no": no, "bid_ntce_ord": ord_,
+                "or_group": f"{req_idx}.{cpt.get('or_group', '1')}",
+                "license_code": code, "license_name": mn.license.get(code) if code else None,
+                "method": cpt.get("method", "none"), "source": cpt.get("source", "license_field"),
+                "qualifier": cpt.get("qualifier"), "name_raw": raw,
+            })
 
-    # ④ 무시 목록 (코드도 없고 면허도 아닌 것)
-    if _LIC_IGNORE.search(text):
-        r.method = "ignored"
-        return r
+    # ── ② 지역 ──
+    site = bid.get("cnstrtsite_rgn_nm")
+    for raw in (bid.get("region_limit_names") or []):
+        r = norm.normalize_region(raw, site)
+        code = r.get("code")
+        out["regions"].append({
+            "bid_ntce_no": no, "bid_ntce_ord": ord_, "region_code": code,
+            "region_name": mn.region.get(code) if code else None,
+            "method": r.get("method", "none"), "flag": r.get("flag"), "name_raw": raw,
+        })
 
-    # ⓪-d (v1.4) 총칭 → 공식 세부 업종 OR 확장 (예: "소프트웨어사업자" → SW사업자 4종)
-    if text in _LIC_UMBRELLA:
-        codes = [c for c in (_lic_lookup(ctx, n) for n in _LIC_UMBRELLA[text]) if c]
-        if codes:
-            r.codes, r.method = codes, "rule+alias"
-            return r
+    # ── ③ 인력 ──
+    for req in (bid.get("personnel_reqs") or []):
+        p = norm.normalize_personnel(req.get("field"), req.get("grade"), req.get("count"))
+        code = p.get("qual_code")
+        out["personnel"].append({
+            "bid_ntce_no": no, "bid_ntce_ord": ord_, "qual_code": code,
+            "qual_name": mn.personnel.get(code) if code else None,
+            "role_field": p.get("role_field"), "headcount": p.get("headcount") or 1,
+            "method": p.get("method", "none"), "grade_raw": p.get("grade_raw"),
+        })
 
-    # v1.5: 소방 복합 (일반(기계및전기)) 또는 전문 → 보수적 근사 (전문 단독, false-pass 방지 방향)
-    if _LIC_FIRE_COMPOSITE.search(text):
-        cc = _lic_lookup(ctx, "전문소방시설공사업")
-        if cc:
-            r.codes, r.method = [cc], "rule+alias"
-            r.qualifier = "보수매핑: 일반소방(기계+전기) 대안 미반영"
-            return r
+    # ── ④ 품목 + 직생 흡수 ──
+    dp_req = bool(bid.get("direct_production_req"))
+    for req in (bid.get("item_codes") or []):
+        raw = req.get("code") or req.get("name") or ""
+        it = norm.normalize_item(str(raw))
+        code = it.get("item_code")
+        out["items"].append({
+            "bid_ntce_no": no, "bid_ntce_ord": ord_, "item_code": code,
+            "item_name": mn.item.get(code) if code else None,
+            "direct_production_req": dp_req,           # 직생 요구를 품목 행에 부여
+            "method": it.get("method", "none"), "source": it.get("source", "item_field"),
+            "name_raw": str(raw),
+        })
+    # 직생 요구인데 품목이 하나도 없으면 요구 유실 방지용 플레이스홀더 행
+    if dp_req and not out["items"]:
+        out["items"].append({
+            "bid_ntce_no": no, "bid_ntce_ord": ord_, "item_code": None, "item_name": None,
+            "direct_production_req": True, "method": "none", "source": "item_field",
+            "name_raw": "직접생산확인 요구(품목 미상)",
+        })
 
-    # qualifier 분리 보존 (괄호형 + 문장형)
-    q = _LIC_QUALIFIER.search(text)
-    if q:
-        r.qualifier = q.group(0).strip("()[]")
-        text = _LIC_QUALIFIER.sub("", text).strip()
-    mf = _LIC_MAINFIELD.search(text)
-    if mf:
-        r.qualifier = (r.qualifier + "; " if r.qualifier else "") + mf.group(0).strip()
-        text = _LIC_MAINFIELD.sub("", text).strip()
+    # ── ⑤ 실적 (파싱) ──
+    for req in (bid.get("performance_reqs") or []):
+        row = parse_performance(req); row.update(bid_ntce_no=no, bid_ntce_ord=ord_)
+        out["performances"].append(row)
 
-    # 원형 별칭 조회 (규칙 적용 전)
-    code = _lic_lookup(ctx, text)
-    if code:
-        r.codes, r.method = [code], "alias"
-        return r
+    # ── ⑥ 인증 (라우팅 후 적재) ──
+    for c in (bid.get("required_certs") or []):
+        raw = c.get("name") if isinstance(c, dict) else c
+        row = route_cert(raw, norm, mn)
+        if row: row.update(bid_ntce_no=no, bid_ntce_ord=ord_); out["certs"].append(row)
 
-    # ③ OR 분해를 먼저 (접미사 제거가 " 또는 " 구조를 깨지 않도록, v1.2 순서 교정)
-    #    → 컴포넌트별로 ② 접미사·래퍼 제거 → 별칭 조회
-    base = text
-    for pat, repl in _LIC_WRAPPER:
-        base = pat.sub(repl, base).strip()
+    # ── ⑦ 시공능력 (파싱) ──
+    for req in (bid.get("capacity_reqs") or []):
+        row = parse_capacity(req, norm); row.update(bid_ntce_no=no, bid_ntce_ord=ord_)
+        out["capacity"].append(row)
 
-    def _resolve(comp: str, depth: int = 0) -> list | None:
-        """v1.5: 컴포넌트 재귀 해석 — 중첩 OR("철도·궤도 또는 종합건설업(토목 또는 토목건축)") 대응."""
-        c2 = _strip_suffixes(_clean(comp))
-        for p, rp in _LIC_WRAPPER:
-            c2 = p.sub(rp, c2).strip()
-        c2 = _LIC_MAINFIELD.sub("", c2).strip()
-        cc = _lic_lookup(ctx, c2)
-        if cc:
-            return [cc]
-        if depth < 2:
-            subs = _split_or(c2)
-            if len(subs) > 1:
-                acc = []
-                for s in subs:
-                    got = _resolve(s, depth + 1)
-                    if got is None:
-                        return None
-                    acc.extend(got)
-                return acc
-        return None
+    # ── ⑧ 규모 (요구 있을 때만 1행. 'none'/미상 → 행 없음) ──
+    size = bid.get("company_size_limit")
+    if size in SIZE_ENUM:
+        out["size"].append({"bid_ntce_no": no, "bid_ntce_ord": ord_, "size_limit": size,
+                             "name_raw": size, "method": "rule0"})
 
-    candidates = _split_or(base)
-    codes, comps = [], []
-    for c in candidates:
-        comps.append(_strip_suffixes(_clean(c)))
-        got = _resolve(c)
-        if got:
-            codes.extend(got)
-    if codes and len(codes) >= len(candidates):   # 전 컴포넌트 해석 시에만 확정 (중첩 OR은 코드가 더 많을 수 있음)
-        transformed = len(candidates) > 1 or len(codes) > 1 or (comps and comps[0] != text)
-        r.codes, r.method = codes, ("rule+alias" if transformed else "alias")
-        return r
-    # v1.2: 분해 결과가 전부 총칭이면 무시 ("공사업 등록 또는 면허" 등)
-    if comps and all(c in _LIC_GENERIC or not c for c in comps):
-        r.method = "ignored"
-        return r
-    # v1.3: 물품 품명이 면허 필드에 혼입 ("유틸리티소프트웨어") → item 라우팅
-    ic = ctx.item_names.get(text)
-    if ic:
-        r.codes, r.method = [ic], "route:item"
-        return r
+    # ── ⑨ 신용 (요구 TRUE일 때만 1행) ──
+    if bid.get("credit_rating_req"):
+        out["credit"].append({"bid_ntce_no": no, "bid_ntce_ord": ord_, "required": True,
+                              "min_grade": None, "name_raw": "신용등급 요구", "method": "rule0"})
 
-    r.method = "none"
-    return r
-
-
-# ────────────────────────────────────────────────
-# 지역 (region)
-# ────────────────────────────────────────────────
-_RGN_NATIONWIDE = {"전국", "제한없음", "전지역"}
-_RGN_SITE_REF = re.compile(r"공사현장|현장을?\s*관할")
-_RGN_IGNORE = re.compile(r"\d+-\d+|일원$|번지|^시·도$|^시도$")
-
-
-def normalize_region(raw: str, ctx: LookupContext) -> Result:
-    r = Result(raw=raw)
-    if not raw or not raw.strip():
-        return r
-    text = _clean(raw)
-
-    if text in _RGN_NATIONWIDE:
-        r.method = "special:nationwide"     # 지역 제한 없음으로 처리
-        return r
-    if _RGN_SITE_REF.search(text):
-        r.method = "special:site_ref"       # cnstrtsite_rgn_nm 참조 필요
-        return r
-    if _RGN_IGNORE.search(text):
-        r.method = "ignored"                # 주소·불완전 추출
-        return r
-
-    code = ctx.find("region", text)
-    if code:
-        r.codes, r.method = [code], "alias"
-        return r
-    # "관할구역" 제거 후 재시도
-    stripped = re.sub(r"\s*관할구역$", "", text)
-    if stripped != text:
-        code = ctx.find("region", stripped)
-        if code:
-            r.codes, r.method = [code], "rule+alias"
-            return r
-    r.method = "none"
-    return r
+    # ── 지역의무공동도급 의무지역 (신호, 다중값) ──
+    for raw in (bid.get("jntcontrct_duty_rgns") or []):
+        r = norm.normalize_region(raw)
+        code = r.get("code")
+        out["region_duty"].append({
+            "bid_ntce_no": no, "bid_ntce_ord": ord_, "region_code": code,
+            "region_name": mn.region.get(code) if code else None,
+            "method": r.get("method", "none"), "name_raw": raw,
+        })
+    return out
 
 
-# ────────────────────────────────────────────────
-# 기술인력 등급 (personnel)
-# ────────────────────────────────────────────────
-_PERS_IGNORE = re.compile(r"상시\s*근로자|^기타$|^전문$|책임 또는 참여|유자격자")
+# ─────────────────────────────────────────────────────────────
+# 쓰기 (멱등 트랜잭션) — 공고 단위 DELETE(summary CASCADE)→INSERT
+# ─────────────────────────────────────────────────────────────
+_CHILD_TABLES = {
+    "licenses": "bid_qual_licenses", "regions": "bid_qual_regions",
+    "personnel": "bid_qual_personnel", "items": "bid_qual_items",
+    "performances": "bid_qual_performances", "certs": "bid_qual_certs",
+    "capacity": "bid_qual_capacity", "size": "bid_qual_size",
+    "credit": "bid_qual_credit", "region_duty": "bid_qual_region_duty",
+}
+
+def _insert(cur, table: str, row: dict):
+    cols = list(row.keys())
+    cur.execute(
+        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join(['%s']*len(cols))})",
+        [row[c] for c in cols])
+
+def write_bid(conn, no: str, ord_: str, rows: dict[str, list[dict]], dry_run: bool = True) -> int:
+    """공고 1건 멱등 적재. 반환: INSERT된 총 행 수 (dry_run이면 계획 행 수)."""
+    total = sum(len(v) for v in rows.values())
+    if dry_run:
+        log.info("[DRY_RUN] %s_%s → %d rows %s", no, ord_, total,
+                 {k: len(v) for k, v in rows.items() if v})
+        return total
+    with conn.transaction():
+        with conn.cursor() as cur:
+            # summary 삭제 → 자식 CASCADE 소거 (멱등 재작성)
+            cur.execute("DELETE FROM bid_qual_summary WHERE bid_ntce_no=%s AND bid_ntce_ord=%s", (no, ord_))
+            for r in rows["summary"]:
+                _insert(cur, "bid_qual_summary", r)
+            for key, table in _CHILD_TABLES.items():
+                for r in rows[key]:
+                    _insert(cur, table, r)
+    return total
 
 
-def normalize_personnel_grade(raw: str, ctx: LookupContext) -> Result:
-    r = Result(raw=raw)
-    if raw is None or not str(raw).strip():
-        r.method = "special:no_grade"       # 등급 미지정 → 인원수만 비교
-        return r
-    text = _clean(str(raw))
+# ─────────────────────────────────────────────────────────────
+# 대상 선정 + 러너
+# ─────────────────────────────────────────────────────────────
+def select_targets(conn, current_version: str) -> list[dict]:
+    """정규화 필요 공고 = merged/partial 중 미정규화·재병합·버전상이."""
+    with conn.cursor(row_factory=_dict_row(conn)) as cur:
+        cur.execute("""
+            SELECT b.* FROM bid_table b
+            LEFT JOIN bid_qual_summary s USING (bid_ntce_no, bid_ntce_ord)
+            WHERE b.qual_status IN ('merged','partial')
+              AND (s.bid_ntce_no IS NULL
+                   OR b.merged_at > s.normalized_at
+                   OR s.normalizer_version <> %s)
+        """, (current_version,))
+        return cur.fetchall()
 
-    if _PERS_IGNORE.search(text):
-        r.method = "ignored"
-        return r
+def _dict_row(conn):
+    # psycopg3 dict row factory 지연 import (테스트 주입 시 불필요)
+    from psycopg.rows import dict_row
+    return dict_row
 
-    code = ctx.find("personnel", text)
-    if code:
-        r.codes, r.method = [code], "alias"
-        return r
-    # ② " 이상" 제거 + 기술인→기술자 통일 후 재시도
-    stripped = re.sub(r"\s*이상$", "", text).replace("기술인", "기술자").strip()
-    if stripped != text:
-        code = ctx.find("personnel", stripped)
-        if code:
-            r.codes, r.method = [code], "rule+alias"
-            return r
-    # ③ OR 분해 ("소방기술사 또는 소방설비기사(기계 및 전기)")
-    parts = _split_or(text)
-    if len(parts) > 1:
-        codes = [ctx.find("personnel", _clean(p)) for p in parts]
-        codes = [c for c in codes if c]
-        if codes:
-            r.codes, r.method = codes, "rule+alias"
-            return r
-    r.method = "none"
-    return r
-
-
-# ────────────────────────────────────────────────
-# 물품 (item)
-# ────────────────────────────────────────────────
-_ITEM_PURE = re.compile(r"^\d{8}$|^\d{10}$")
-_ITEM_EMBED = re.compile(r"(\d{10}|\d{8})")
-_ITEM_ROUTE_LICENSE = re.compile(r"^\d{4}$")
+def run(conn, norm: Normalizer, current_version: str = NORMALIZER_VERSION, dry_run: bool = True) -> dict:
+    mn = MasterNames.load(conn, norm)
+    targets = select_targets(conn, current_version)
+    log.info("대상 공고 %d건 (dry_run=%s)", len(targets), dry_run)
+    n_bids = n_rows = 0
+    for bid in targets:
+        rows = build_rows(bid, norm, mn)
+        n_rows += write_bid(conn, bid["bid_ntce_no"], bid["bid_ntce_ord"], rows, dry_run)
+        n_bids += 1
+    log.info("완료: 공고 %d건, 행 %d개%s", n_bids, n_rows, " (DRY_RUN — 미기록)" if dry_run else "")
+    return {"bids": n_bids, "rows": n_rows, "dry_run": dry_run}
 
 
-def normalize_item_code(raw: str, ctx: LookupContext, type_hint: str | None = None) -> Result:
-    """type_hint: LLM이 추출한 type 필드 (세부품명번호/업종코드/재고번호 등).
-    있으면 자릿수 추정보다 우선한다 (2026-07-22 실측: type 라벨링 활발 확인)."""
-    r = Result(raw=raw)
-    if not raw or not raw.strip():
-        return r
-    text = _clean(raw)
-
-    # ⓪-a type 힌트 우선 (자릿수 추정보다 안전)
-    if type_hint:
-        th = type_hint.strip()
-        if "업종" in th:                      # 업종코드 → license 도메인
-            if text in ctx.license_codes:
-                r.codes, r.method = [text], "route:license"
-            else:
-                r.method = "none"
-            return r
-        if any(k in th for k in ("재고", "식별", "KS")):   # 타 코드 체계 — 매칭 대상 아님
-            r.method = "ignored"
-            return r
-        # 세부품명(번호)/물품분류번호 → 아래 물품 규칙으로 계속
-
-    # ⓪ 순수 8/10자리
-    if _ITEM_PURE.match(text):
-        if text in ctx.item_codes:
-            r.codes, r.method = [text], "rule0"
-        else:
-            r.method = "none"               # 형식은 맞으나 폐지/오기 — 확인 대상
-        return r
-    # ⑤ 4자리 → 업종코드 라우팅 (용역 공고 대량 관측)
-    if _ITEM_ROUTE_LICENSE.match(text):
-        if text in ctx.license_codes:
-            r.codes, r.method = [text], "route:license"
-        else:
-            r.method = "none"
-        return r
-    # ① 텍스트 내장 코드 — "데이터처리서비스(8111200201)" 유형
-    m = _ITEM_EMBED.search(text)
-    if m and m.group(1) in ctx.item_codes:
-        r.codes, r.method = [m.group(1)], "rule"
-        return r
-    # ② 한글 이름 → item_name 역매핑
-    code = ctx.item_names.get(text)
-    if code:
-        r.codes, r.method = [code], "name_map"
-        return r
-    # ④ 그 외 텍스트(제품 스펙 등)
-    r.method = "ignored"
-    return r
+if __name__ == "__main__":
+    import psycopg
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    import normalizer  # 실제 normalizer.py 주입 (없으면 ImportError — 인터페이스 참조)
+    dsn = os.environ["DB_DSN"]                     # key=value 전체 문자열
+    dry = os.environ.get("DRY_RUN", "1") != "0"    # 기본 DRY_RUN
+    with psycopg.connect(dsn) as conn:
+        run(conn, normalizer, dry_run=dry)
