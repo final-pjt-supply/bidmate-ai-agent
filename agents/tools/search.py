@@ -38,6 +38,13 @@ _DEDUPE_OVERFETCH = 3
 # 추천 시 마감·차수 필터로 걸러질 것을 감안한 추가 여유분.
 _RECOMMEND_OVERFETCH = 3
 
+# 공고 단위 합산 시 청크 후보 폭.
+# 공고당 여러 청크가 걸려야 합산이 의미를 가지므로 넉넉히 가져온다.
+_AGGREGATE_FETCH_MULTIPLIER = 40
+
+# OpenSearch knn 제약: k는 (0, 10000] 범위여야 한다.
+_KNN_K_MAX = 10000
+
 # 정규화 하이브리드용 임시 search pipeline.
 # 클러스터에 등록하지 않고 요청 본문에 실어 보내므로 쓰기 권한이 필요 없다.
 # min_max로 BM25/knn 점수를 각각 0~1로 정규화한 뒤 가중 산술평균으로 합친다.
@@ -205,7 +212,7 @@ def _run_search(
         size=size,
         knn_weight=knn_weight,
         bm25_weight=bm25_weight,
-        knn_k=size * mult,
+        knn_k=min(size * mult, _KNN_K_MAX),
     )
     resp = get_client().search(index=s.opensearch_index, body=body)
 
@@ -260,26 +267,51 @@ def search_bids(
     return SearchResult(query=query, hits=hits, total_hits=total_hits)
 
 
-def _dedupe_by_bid(hits: list[SearchHit]) -> list[BidHit]:
-    """점수 내림차순 결과를 bid_id 기준으로 묶어 공고 단위로 만든다.
+def _aggregate_by_bid(
+    hits: list[SearchHit],
+    *,
+    aggregate: str,
+    sum_top_n: int,
+) -> list[BidHit]:
+    """점수 내림차순 결과를 bid_id 기준으로 묶어 공고 단위 점수를 만든다.
 
-    각 공고의 첫(=최고점) 청크가 대표가 되고, 해당 공고에서 걸린 청크 수를 센다.
-    입력이 이미 점수 내림차순이므로, 처음 만난 bid_id가 곧 최고점이다.
+    집계 방식
+      "max"      각 공고의 최고 청크 점수만 사용 (기존 방식).
+                 "한 번 스친 언급"과 "문서 전체가 그 주제"를 구별하지 못한다.
+      "sum_topn" 각 공고의 상위 N개 청크 점수를 합산.
+                 관련 공고는 여러 청크에서 반복 득점하므로 총점이 높아진다.
+
+    sum 대신 상위 N개로 제한하는 이유: 단순 전체 합산은 청크가 많은 긴 공고가
+    관련도와 무관하게 유리해진다(길이 편향). 상위 N개만 더하면 "여러 곳에서
+    관련 내용이 나온다"는 신호는 살리면서 길이 편향은 막을 수 있다.
+
+    실측 근거: "소프트웨어" 질의 기준 관련 공고 34개 청크 매칭 vs 무관 공고 0개,
+    "청소" 질의 기준 관련 공고 38/26개 vs 무관 공고 0개. 관련 공고끼리는
+    비슷하게 나오므로 합산이 관련 공고 간 순위를 뒤흔들지는 않는다.
+
+    입력이 점수 내림차순이므로 각 공고에서 처음 만난 청크가 곧 최고점이다.
     """
-    by_bid: dict[str, BidHit] = {}
+    grouped: dict[str, list[SearchHit]] = {}
     for h in hits:
-        existing = by_bid.get(h.bid_id)
-        if existing is None:
-            by_bid[h.bid_id] = BidHit(
-                bid_id=h.bid_id,
-                score=h.score,
-                top_hit=h,
-                matched_chunks=1,
-            )
-        else:
-            existing.matched_chunks += 1
-    # dict는 삽입 순서를 보존하므로 이미 점수 내림차순이다.
-    return list(by_bid.values())
+        grouped.setdefault(h.bid_id, []).append(h)
+
+    results: list[BidHit] = []
+    for bid_id, group in grouped.items():
+        top = group[0]                       # 입력이 내림차순이므로 첫 항목이 최고점
+        used = group[:sum_top_n] if aggregate == "sum_topn" else group[:1]
+        score = sum(h.score for h in used) if aggregate == "sum_topn" else top.score
+        results.append(BidHit(
+            bid_id=bid_id,
+            score=score,
+            top_hit=top,
+            matched_chunks=len(group),
+            max_score=top.score,
+            summed_chunks=len(used),
+            document_ids=sorted({h.chunk.document_id for h in group}),
+        ))
+
+    results.sort(key=lambda b: b.score, reverse=True)
+    return results
 
 
 def search_bids_grouped(
@@ -292,29 +324,48 @@ def search_bids_grouped(
     bm25_weight: float | None = None,
     normalize: bool | None = None,
     knn_multiplier: int | None = None,
+    aggregate: str | None = None,
+    sum_top_n: int | None = None,
+    min_score: float | None = None,
+    min_chunks: int | None = None,
+    fetch_size: int | None = None,
 ) -> BidSearchResult:
     """공고 단위 하이브리드 검색 (추천 목록용).
 
-    bid_id 기준 중복을 제거해, 서로 다른 공고 top_k개를 반환한다.
-    중복 제거로 개수가 줄어드는 것을 감안해 내부적으로 넉넉히 검색한 뒤 자른다.
+    청크 검색 결과를 bid_id로 묶어 공고 점수를 만든다. 집계 방식은
+    설정(AGGREGATE)으로 정하며 기본은 상위 N개 합산이다.
 
     Args:
-        query: 사용자 질의 텍스트.
-        bid_ids: 지정 시 해당 공고들로만 검색 범위 제한.
-        types: 청크 종류 필터. None이면 전부 포함.
-        top_k: 반환할 공고 수. None이면 설정 기본값.
-        knn_weight / bm25_weight: 벡터·키워드 가중치. None이면 설정 기본값.
+        query: 사용자 질의.
+        bid_ids: 검색 범위 제한.
+        types: 청크 종류 필터.
+        top_k: 반환할 공고 수.
+        knn_weight / bm25_weight / normalize / knn_multiplier: 검색 파라미터.
+        aggregate: "max" | "sum_topn". None이면 설정 기본값.
+        sum_top_n: 합산에 쓸 청크 수. None이면 설정 기본값.
+        min_score: 이 점수 미만 공고 제외. None이면 설정 기본값(0=미적용).
+        min_chunks: 걸린 청크가 이 수 미만이면 제외. None이면 설정 기본값.
+        fetch_size: 가져올 청크 수. None이면 top_k에 비례해 자동 결정.
 
     Returns:
-        BidSearchResult (점수 내림차순 공고 목록).
+        BidSearchResult (집계 점수 내림차순).
     """
     query = (query or "").strip()
     if not query:
         return BidSearchResult(query=query, bids=[], total_hits=0)
 
-    top_k = top_k or get_settings().default_top_k
-    # 중복 제거 후에도 top_k개 공고가 남도록 넉넉히 청크를 뽑는다.
-    fetch_size = top_k * _DEDUPE_OVERFETCH
+    s = get_settings()
+    top_k = top_k or s.default_top_k
+    aggregate = aggregate or s.aggregate
+    sum_top_n = sum_top_n if sum_top_n is not None else s.sum_top_n
+    min_score = min_score if min_score is not None else s.min_score
+    min_chunks = min_chunks if min_chunks is not None else s.min_chunks
+
+    # 합산 방식은 공고당 여러 청크가 필요하므로 후보를 크게 잡는다.
+    if fetch_size is None:
+        multiplier = (_AGGREGATE_FETCH_MULTIPLIER
+                      if aggregate == "sum_topn" else _DEDUPE_OVERFETCH)
+        fetch_size = top_k * multiplier
 
     hits, total_hits = _run_search(
         query,
@@ -327,8 +378,15 @@ def search_bids_grouped(
         knn_multiplier=knn_multiplier,
     )
 
-    bids = _dedupe_by_bid(hits)[:top_k]
-    return BidSearchResult(query=query, bids=bids, total_hits=total_hits)
+    bids = _aggregate_by_bid(hits, aggregate=aggregate, sum_top_n=sum_top_n)
+
+    # 하한선 — 관련도가 낮은 공고를 top_k 채우기용으로 끌어오지 않는다
+    if min_chunks > 1:
+        bids = [b for b in bids if b.matched_chunks >= min_chunks]
+    if min_score > 0:
+        bids = [b for b in bids if b.score >= min_score]
+
+    return BidSearchResult(query=query, bids=bids[:top_k], total_hits=total_hits)
 
 
 def recommend_bids(
@@ -339,6 +397,10 @@ def recommend_bids(
     types: list[str] | None = None,
     only_open: bool = True,
     latest_ord_only: bool = True,
+    aggregate: str | None = None,
+    sum_top_n: int | None = None,
+    min_score: float | None = None,
+    min_chunks: int | None = None,
 ) -> list[RecommendedBid]:
     """추천 공고 목록을 만든다: 검색(OpenSearch) + 공고 정보(PostgreSQL).
 
@@ -380,12 +442,16 @@ def recommend_bids(
     if allowed is not None and not allowed:
         return []
 
-    # 2) 좁혀진 범위에서 검색 (여유분은 청크 중복 제거용)
+    # 2) 좁혀진 범위에서 검색 (집계·하한선은 search_bids_grouped가 처리)
     search_result = search_bids_grouped(
         query,
         bid_ids=allowed,
         types=types,
-        top_k=top_k * _RECOMMEND_OVERFETCH,
+        top_k=top_k,
+        aggregate=aggregate,
+        sum_top_n=sum_top_n,
+        min_score=min_score,
+        min_chunks=min_chunks,
     )
     hits = search_result.bids[:top_k]
     if not hits:

@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # (한쪽 목록에만 있는 문서는 다른 쪽 기여가 0이 되기 때문).
     knn_candidate_multiplier: int = Field(20, alias="KNN_CANDIDATE_MULTIPLIER")
 
+    # --- 공고 단위 집계 ---
+    # "max": 최고 청크 점수만 / "sum_topn": 상위 N개 청크 합산
+    aggregate: str = Field("sum_topn", alias="AGGREGATE")
+    sum_top_n: int = Field(5, alias="SUM_TOP_N")
+    # 하한선 (0이면 미적용)
+    min_score: float = Field(0.0, alias="MIN_SCORE")
+    min_chunks: int = Field(1, alias="MIN_CHUNKS")
+
     @property
     def pg_dsn(self) -> str:
         return (

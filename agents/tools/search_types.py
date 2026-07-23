@@ -45,12 +45,21 @@ class SearchResult(BaseModel):
 
 
 class BidHit(BaseModel):
-    """공고 1건 (중복 제거 후 대표 청크). 추천 목록용."""
+    """공고 1건 (청크들을 공고 단위로 집계). 추천 목록용.
+
+    score는 집계 방식(aggregate)에 따라 의미가 다르다.
+      "max"    최고 청크 점수 하나 (단일 청크만 봄)
+      "sum_topn" 상위 N개 청크 점수 합 (여러 청크에 걸친 관련도 반영)
+    """
 
     bid_id: str
-    score: float = Field(..., description="이 공고의 최고 청크 점수")
+    score: float = Field(..., description="집계된 공고 점수")
     top_hit: SearchHit = Field(..., description="가장 점수 높은 대표 청크")
     matched_chunks: int = Field(1, description="이 공고에서 검색에 걸린 청크 수")
+    max_score: float = Field(0.0, description="최고 청크 점수 (집계 방식과 무관)")
+    summed_chunks: int = Field(0, description="합산에 실제 사용된 청크 수")
+    document_ids: list[str] = Field(
+        default_factory=list, description="걸린 청크가 속한 문서 종류")
 
 
 class BidSearchResult(BaseModel):
