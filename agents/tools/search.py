@@ -363,7 +363,7 @@ def recommend_bids(
     Returns:
         RecommendedBid 목록 (검색 점수 내림차순).
     """
-    from agents.tools.bid_info import fetch_bid_info, resolve_filters
+    from agents.tools.bid_info import fetch_bid_info, filters_to_bid_ids
 
     query = (query or "").strip()
     if not query:
@@ -372,7 +372,7 @@ def recommend_bids(
     top_k = top_k or get_settings().default_top_k
 
     # 1) 검색 대상을 조건에 맞는 공고로 미리 좁힌다
-    allowed = resolve_filters(
+    allowed = filters_to_bid_ids(
         filters,
         only_open=only_open,
         latest_ord_only=latest_ord_only,
@@ -394,3 +394,57 @@ def recommend_bids(
     # 3) 공고 메타 채우기 (한 번의 쿼리)
     info_map = fetch_bid_info([h.bid_id for h in hits])
     return [RecommendedBid(hit=h, info=info_map.get(h.bid_id)) for h in hits]
+
+
+def retrieve_chunks(
+    query: str,
+    *,
+    filters: dict | Filters | None = None,
+    top_k: int | None = None,
+    types: list[str] | None = None,
+) -> list[Chunk]:
+    """그래프 retrieval 노드용 진입점 (도구 호출 계약).
+
+    노드는 이 함수만 부르면 되고, 검색 내부 구조(SearchHit, 점수, 필터 해석)를
+    알 필요가 없다. 반환은 팀 공용 계약의 Chunk 리스트뿐이다.
+
+    필터 처리
+      - bid_ids가 있으면(Case 2 진입 / 멀티턴 스코프 승계) 그 공고들로만 한정
+      - 없으면 나머지 조건(마감·예산·업종)을 bid_table 조회로 해석해 범위 지정
+      - 조건이 전혀 없으면 마감 전 공고 전체를 대상으로 검색
+
+    Args:
+        query: 검색 질의. 보통 QueryIntent.normalized_query.
+        filters: AgentState의 resolved_filters(dict) 또는 Filters 인스턴스.
+        top_k: 반환 청크 수. None이면 설정 기본값.
+        types: 청크 종류 필터 (text/table/box). None이면 전부.
+
+    Returns:
+        점수 내림차순 Chunk 리스트. 결과가 없으면 빈 리스트.
+    """
+    from agents.tools.bid_info import filters_to_bid_ids
+
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    # dict(resolved_filters) → Filters 정규화
+    if isinstance(filters, dict):
+        filters_obj = Filters(**{k: v for k, v in filters.items()
+                                 if k in Filters.model_fields})
+    else:
+        filters_obj = filters
+
+    # 검색 대상 bid_id 범위를 먼저 확정한다.
+    # 색인 공고 상당수가 이미 마감 상태라, 검색 후 걸러내면 후보 대부분이 탈락한다.
+    allowed = filters_to_bid_ids(filters_obj)
+    if allowed is not None and not allowed:
+        return []
+
+    result = search_bids(
+        query,
+        bid_ids=allowed,
+        types=types,
+        top_k=top_k,
+    )
+    return [h.chunk for h in result.hits]

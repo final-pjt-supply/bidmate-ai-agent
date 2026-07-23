@@ -157,7 +157,7 @@ def open_bid_ids(
         return [row["bid_id"] for row in cur.fetchall()]
 
 
-def resolve_filters(
+def filters_to_bid_ids(
     filters: Filters | None = None,
     *,
     only_open: bool = True,
@@ -166,11 +166,15 @@ def resolve_filters(
 ) -> list[str] | None:
     """팀 계약의 Filters를 bid_table 조회로 해석해 bid_id 목록을 만든다.
 
+    주의: 팀 agents/merge.py에도 resolve_filters가 있으나 역할이 다르다.
+    merge.resolve_filters = 멀티턴 필터 병합(결정적, DB 미접근)
+    이 함수                = 병합된 필터를 DB 조회로 bid_id 목록화
+
     검색 전에 이 목록을 OpenSearch bid_id 필터로 넘기면, 조건에 맞는 공고
     안에서만 검색하게 되어 "검색 후 걸러내기"의 낭비가 없어진다.
 
     처리 범위
-        bid_ids              그대로 사용 (교집합)
+        bid_ids              지정 시 그대로 반환 (다른 조건·마감 필터 미적용)
         deadline_within_days bid_clse_dt 기준 N일 이내
         budget_min/max       presmpt_prce 범위
         category             bid_category (주의: 아래 미결 참조)
@@ -188,6 +192,12 @@ def resolve_filters(
         조건에 맞는 bid_id 목록. 조건이 하나도 없고 only_open도 False면 None
         (= 전체 검색).
     """
+    # bid_ids가 있으면 그것이 곧 스코프다 (Case 2 진입 / 멀티턴 승계).
+    # 마감·차수 필터를 덧씌우면 "이 공고 자격 뭐야?"에 답하지 못하게 되므로
+    # DB를 거치지 않고 그대로 돌려준다.
+    if filters is not None and filters.bid_ids:
+        return list(filters.bid_ids)
+
     where: list[str] = []
     params: list[object] = []
 
@@ -195,10 +205,6 @@ def resolve_filters(
         where.append(_OPEN_CONDITION)
 
     if filters is not None:
-        if filters.bid_ids:
-            where.append("bid_id = ANY(%s)")
-            params.append(filters.bid_ids)
-
         if filters.deadline_within_days is not None:
             where.append(
                 "bid_clse_dt IS NOT NULL "
