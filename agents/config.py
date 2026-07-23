@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     pg_database: str = Field(..., alias="PG_DATABASE")
     pg_user: str = Field(..., alias="PG_USER")
     pg_password: str = Field(..., alias="PG_PASSWORD")
+    # 세션 시간대. RDS 기본은 UTC이고 bid_table 일시 컬럼은 KST naive라,
+    # 고정하지 않으면 NOW() 비교가 9시간 어긋난다(실측 110건 차이).
+    pg_timezone: str = Field("Asia/Seoul", alias="PG_TIMEZONE")
 
     # --- Cloudflare Workers AI (임베딩) ---
     cf_account_id: str = Field(..., alias="CF_ACCOUNT_ID")
