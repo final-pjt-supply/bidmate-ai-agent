@@ -40,6 +40,18 @@ CREATE TABLE IF NOT EXISTS item_code_master (
   is_sme_product BOOLEAN DEFAULT FALSE      -- 중기간 경쟁제품 (별도 갱신)
 );
 
+-- 인증 마스터 (회사가 갖는 인증 — 유효기간 비교용)
+CREATE TABLE IF NOT EXISTS cert_master (
+  cert_code   VARCHAR(30) PRIMARY KEY,       -- 공식 코드 부재 → 자체 시맨틱 코드
+  cert_name   VARCHAR(100) NOT NULL,
+  category    VARCHAR(30)  NOT NULL,
+  issuer      VARCHAR(100),
+  law_basis   VARCHAR(150),
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_cert_category ON cert_master (category);
+
+
 -- 통합 별칭 테이블 (표기 변형 → 표준 코드 번역 사전, 3개 도메인 공용)
 CREATE TABLE IF NOT EXISTS master_alias (
   entity_type    VARCHAR(20) NOT NULL,      -- 'license' / 'region' / 'personnel'
@@ -48,3 +60,5 @@ CREATE TABLE IF NOT EXISTS master_alias (
   source         VARCHAR(20) DEFAULT 'manual',  -- manual / llm / rule
   PRIMARY KEY (entity_type, alias_text)
 );
+
+
