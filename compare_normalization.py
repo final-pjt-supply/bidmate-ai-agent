@@ -19,13 +19,13 @@ TOP_K = 5
 
 def analyze(query: str, normalize: bool) -> dict:
     r = search_bids(query, top_k=TOP_K, normalize=normalize)
-    scores = [round(c.score, 4) for c in r.chunks]
+    scores = [round(h.score, 4) for h in r.hits]
     return {
         "scores": scores,
         "unique": len(set(scores)),
-        "ids": [c.bid_id for c in r.chunks],
-        "types": [c.type for c in r.chunks],
-        "chunks": r.chunks,
+        "ids": [h.chunk.bid_id for h in r.hits],
+        "types": [h.chunk.type for h in r.hits],
+        "chunks": r.hits,
     }
 
 
@@ -54,9 +54,10 @@ def main() -> None:
         print(f"  타입: bool={dict(Counter(b['types']))} → 정규화={dict(Counter(n['types']))}")
 
         print("\n  [정규화 결과 상위 3건]")
-        for i, c in enumerate(n["chunks"][:3], 1):
+        for i, h in enumerate(n["chunks"][:3], 1):
+            c = h.chunk
             text = c.text.replace("\n", " ").strip()
-            print(f"    [{i}] {c.score:.4f} | {c.bid_id} | {c.type}")
+            print(f"    [{i}] {h.score:.4f} | {c.bid_id} | {c.type}")
             print(f"        {text[:60]}...")
         print()
 

@@ -28,11 +28,12 @@ def run_one(query: str) -> None:
     print("\n[RAG 검색] search_bids — 근거 청크 수집")
     print("-" * 72)
     result = search_bids(query, top_k=3)
-    if not result.chunks:
+    if not result.hits:
         print("  (결과 없음)")
-    for i, c in enumerate(result.chunks, 1):
+    for i, h in enumerate(result.hits, 1):
+        c = h.chunk
         text = c.text.replace("\n", " ").strip()
-        print(f"  [{i}] {c.score:.3f} | {c.bid_id} | {c.type}")
+        print(f"  [{i}] {h.score:.3f} | {c.bid_id} | {c.type}")
         print(f"      {text[:70]}...")
 
     # 2) 추천 목록용 — 공고 단위 + bid_table 메타

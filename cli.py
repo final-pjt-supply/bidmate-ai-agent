@@ -53,14 +53,15 @@ def cmd_search(query: str) -> None:
         print("  사용법: /search <질의>")
         return
     result = search_bids(query, top_k=OPTS["top_k"])
-    print(f"\n[RAG 검색] 청크 {len(result.chunks)}건 (전체 매칭 {result.total_hits})")
+    print(f"\n[RAG 검색] 청크 {len(result.hits)}건 (전체 매칭 {result.total_hits})")
     print("-" * 70)
-    if not result.chunks:
+    if not result.hits:
         print("  (결과 없음)")
         return
-    for i, c in enumerate(result.chunks, 1):
+    for i, h in enumerate(result.hits, 1):
+        c = h.chunk
         text = c.text.replace("\n", " ").strip()
-        print(f"  [{i}] {c.score:.3f} | {c.bid_id} | {c.type}")
+        print(f"  [{i}] {h.score:.3f} | {c.bid_id} | {c.type}")
         print(f"      {text[:100]}...")
 
 

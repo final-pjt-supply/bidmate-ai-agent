@@ -21,7 +21,7 @@ TOP_K = 5
 
 def analyze(query: str, mult: int) -> dict:
     r = search_bids(query, top_k=TOP_K, normalize=True, knn_multiplier=mult)
-    scores = [round(c.score, 4) for c in r.chunks]
+    scores = [round(h.score, 4) for h in r.hits]
     # 0.5 근처(한쪽 목록에만 걸린 문서)가 몇 개인지
     half = sum(1 for s in scores if abs(s - 0.5) < 0.001)
     spread = (max(scores) - min(scores)) if scores else 0.0
@@ -30,7 +30,7 @@ def analyze(query: str, mult: int) -> dict:
         "unique": len(set(scores)),
         "half": half,
         "spread": round(spread, 4),
-        "types": [c.type for c in r.chunks],
+        "types": [h.chunk.type for h in r.hits],
     }
 
 
