@@ -1,0 +1,46 @@
+name: Gemini PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet requests google-genai google-auth
+
+      - name: Set up Google credentials
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > /tmp/gcp_key.json
+
+      - name: Get PR diff
+        run: |
+          git fetch --quiet origin "${{ github.event.pull_request.base.ref }}"
+          git diff --unified=2 "origin/${{ github.event.pull_request.base.ref }}"...HEAD > diff.txt
+          echo "Diff lines: $(wc -l < diff.txt)"
+
+      - name: Gemini review
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_key.json
+          GCP_PROJECT_ID: "pr-review-bot-501208"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          GEMINI_MODEL: "gemini-2.5-flash"
+        run: python .github/scripts/gemini_review.py
