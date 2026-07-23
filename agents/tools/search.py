@@ -314,6 +314,44 @@ def _aggregate_by_bid(
     return results
 
 
+def _apply_thresholds(
+    bids: list[BidHit],
+    *,
+    min_score: float,
+    min_score_ratio: float,
+    min_chunks: int,
+    min_results: int,
+) -> list[BidHit]:
+    """관련도가 낮은 공고를 잘라낸다. top_k 채우기용으로 끌어오지 않기 위함.
+
+    세 가지 기준을 순서대로 적용한다.
+      min_chunks       걸린 청크 수. 무관 공고는 대개 1~2개만 걸린다.
+      min_score_ratio  1위 대비 비율. 질의별 점수 스케일 차이에 강하다.
+      min_score        절대 점수. 스케일이 질의마다 달라 기본은 끔.
+
+    실측 근거: 관련 공고가 1건뿐인 질의는 2위 비율이 34%로 급락하지만,
+    여러 건인 질의는 84~99%를 유지한다. 40% 부근이 경계로 보인다.
+
+    전부 잘려 빈 결과가 되는 것을 막기 위해 min_results개는 남긴다.
+    """
+    if not bids:
+        return bids
+
+    kept = bids
+    if min_chunks > 1:
+        kept = [b for b in kept if b.matched_chunks >= min_chunks]
+    if min_score_ratio > 0 and kept:
+        cutoff = kept[0].score * min_score_ratio
+        kept = [b for b in kept if b.score >= cutoff]
+    if min_score > 0:
+        kept = [b for b in kept if b.score >= min_score]
+
+    # 과하게 잘렸으면 원본 상위 몇 건은 살려둔다
+    if len(kept) < min_results:
+        kept = bids[:min_results]
+    return kept
+
+
 def search_bids_grouped(
     query: str,
     *,
@@ -327,6 +365,7 @@ def search_bids_grouped(
     aggregate: str | None = None,
     sum_top_n: int | None = None,
     min_score: float | None = None,
+    min_score_ratio: float | None = None,
     min_chunks: int | None = None,
     fetch_size: int | None = None,
 ) -> BidSearchResult:
@@ -343,7 +382,9 @@ def search_bids_grouped(
         knn_weight / bm25_weight / normalize / knn_multiplier: 검색 파라미터.
         aggregate: "max" | "sum_topn". None이면 설정 기본값.
         sum_top_n: 합산에 쓸 청크 수. None이면 설정 기본값.
-        min_score: 이 점수 미만 공고 제외. None이면 설정 기본값(0=미적용).
+        min_score: 절대 점수 하한. None이면 설정 기본값(0=미적용).
+        min_score_ratio: 1위 점수 대비 비율 하한(0.4=40%). 질의별 스케일 차이에
+            강하므로 절대값보다 이쪽을 기본으로 쓴다. None이면 설정 기본값.
         min_chunks: 걸린 청크가 이 수 미만이면 제외. None이면 설정 기본값.
         fetch_size: 가져올 청크 수. None이면 top_k에 비례해 자동 결정.
 
@@ -359,6 +400,8 @@ def search_bids_grouped(
     aggregate = aggregate or s.aggregate
     sum_top_n = sum_top_n if sum_top_n is not None else s.sum_top_n
     min_score = min_score if min_score is not None else s.min_score
+    min_score_ratio = (min_score_ratio if min_score_ratio is not None
+                       else s.min_score_ratio)
     min_chunks = min_chunks if min_chunks is not None else s.min_chunks
 
     # 합산 방식은 공고당 여러 청크가 필요하므로 후보를 크게 잡는다.
@@ -380,12 +423,13 @@ def search_bids_grouped(
 
     bids = _aggregate_by_bid(hits, aggregate=aggregate, sum_top_n=sum_top_n)
 
-    # 하한선 — 관련도가 낮은 공고를 top_k 채우기용으로 끌어오지 않는다
-    if min_chunks > 1:
-        bids = [b for b in bids if b.matched_chunks >= min_chunks]
-    if min_score > 0:
-        bids = [b for b in bids if b.score >= min_score]
-
+    bids = _apply_thresholds(
+        bids,
+        min_score=min_score,
+        min_score_ratio=min_score_ratio,
+        min_chunks=min_chunks,
+        min_results=s.min_results,
+    )
     return BidSearchResult(query=query, bids=bids[:top_k], total_hits=total_hits)
 
 
@@ -400,6 +444,7 @@ def recommend_bids(
     aggregate: str | None = None,
     sum_top_n: int | None = None,
     min_score: float | None = None,
+    min_score_ratio: float | None = None,
     min_chunks: int | None = None,
 ) -> list[RecommendedBid]:
     """추천 공고 목록을 만든다: 검색(OpenSearch) + 공고 정보(PostgreSQL).
@@ -451,6 +496,7 @@ def recommend_bids(
         aggregate=aggregate,
         sum_top_n=sum_top_n,
         min_score=min_score,
+        min_score_ratio=min_score_ratio,
         min_chunks=min_chunks,
     )
     hits = search_result.bids[:top_k]

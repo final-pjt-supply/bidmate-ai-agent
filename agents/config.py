@@ -51,9 +51,22 @@ class Settings(BaseSettings):
     # "max": 최고 청크 점수만 / "sum_topn": 상위 N개 청크 합산
     aggregate: str = Field("sum_topn", alias="AGGREGATE")
     sum_top_n: int = Field(5, alias="SUM_TOP_N")
-    # 하한선 (0이면 미적용)
-    min_score: float = Field(0.0, alias="MIN_SCORE")
-    min_chunks: int = Field(1, alias="MIN_CHUNKS")
+    # --- 하한선 (0이면 미적용) ---
+    # 절대 점수 하한 — 검색이 완전히 실패했을 때의 최후 방어선.
+    # 조건형 질의("오늘 마감인 공고" 등)는 Router가 redirect로 거르는 것이
+    # 설계 의도이므로, C가 그것까지 막으려고 임계값을 올리지 않는다.
+    # 실측: 무의미한 입력("안녕하세요")이 0.815 → 그 위인 0.9로 둔다.
+    # 1.0 이상으로 올리면 관련 있는 결과까지 잘린다(전기공사 1.04/1.01 손실).
+    min_score: float = Field(0.9, alias="MIN_SCORE")
+    # 1위 점수 대비 비율 하한 (0.4 = 1위의 40% 미만 제외).
+    # 절대값과 달리 질의별 스케일 차이에 영향받지 않는다.
+    min_score_ratio: float = Field(0.4, alias="MIN_SCORE_RATIO")
+    # 걸린 청크가 이 수 미만이면 제외. 무관 공고는 대개 1~2개만 걸린다.
+    min_chunks: int = Field(2, alias="MIN_CHUNKS")
+    # 하한선 적용 후에도 최소 이 개수는 남긴다. 기본 0(안전장치 없음) —
+    # 관련 없는 질의에 억지로 결과를 만들어 보여주지 않기 위함이다.
+    # "관련 공고를 찾지 못했습니다"가 무관한 공고를 보여주는 것보다 낫다.
+    min_results: int = Field(0, alias="MIN_RESULTS")
 
     @property
     def pg_dsn(self) -> str:
