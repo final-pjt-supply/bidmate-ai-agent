@@ -10,7 +10,7 @@
     /rec <질의>          추천 목록 (명시적)
     /set <키> <값>       옵션 변경
                          top_k, open, ord, agg(max|sum_topn),
-                         topn, minscore, minchunks
+                         topn, ratio, minchunks, minscore
     /stats               유효 공고 수 확인 (데이터 진단)
     /help                도움말
     /quit                종료
@@ -34,8 +34,9 @@ OPTS = {
     "ord": True,         # 최신 차수만
     "agg": "sum_topn",   # 집계: max | sum_topn
     "topn": 5,           # 합산에 쓸 청크 수
-    "minscore": 0.0,     # 점수 하한선 (0=미적용)
-    "minchunks": 1,      # 최소 걸린 청크 수
+    "minscore": 0.9,     # 절대 점수 하한 (0=미적용)
+    "ratio": 0.4,        # 1위 대비 비율 하한 (0=미적용)
+    "minchunks": 2,      # 최소 걸린 청크 수
 }
 
 CATEGORY_NAMES = {
@@ -83,6 +84,7 @@ def cmd_recommend(query: str) -> None:
         aggregate=OPTS["agg"],
         sum_top_n=OPTS["topn"],
         min_score=OPTS["minscore"],
+        min_score_ratio=OPTS["ratio"],
         min_chunks=OPTS["minchunks"],
     )
     print(f"\n[추천 목록] 공고 {len(recs)}건")
@@ -133,15 +135,16 @@ def cmd_set(args: list[str]) -> None:
         OPTS["topn"] = max(1, int(raw))
     elif key == "minchunks" and raw.isdigit():
         OPTS["minchunks"] = max(1, int(raw))
-    elif key == "minscore":
+    elif key in ("minscore", "ratio"):
         try:
-            OPTS["minscore"] = float(raw)
+            OPTS[key] = float(raw)
         except ValueError:
-            print("  minscore는 숫자여야 합니다")
+            print(f"  {key}는 숫자여야 합니다")
             return
     else:
         print("  사용법: /set top_k 10 | /set agg sum_topn | /set topn 5")
-        print("          /set minscore 1.5 | /set minchunks 2 | /set open false")
+        print("          /set ratio 0.4 | /set minchunks 2 | /set minscore 0")
+        print("          /set open false | /set ord true")
         return
     print(f"  옵션 변경됨: {OPTS}")
 
