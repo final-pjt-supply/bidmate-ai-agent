@@ -11,7 +11,7 @@ GH_TOKEN = os.environ["GH_TOKEN"]
 PR = os.environ["PR_NUMBER"]
 REPO = os.environ["REPO"]
 TITLE = os.environ.get("PR_TITLE", "")
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 MARKER = "<!-- gemini-pr-review -->"
 
 # 1) diff 읽기
