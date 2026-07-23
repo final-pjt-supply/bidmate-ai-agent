@@ -23,10 +23,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install --quiet requests google-genai google-auth
-
-      - name: Set up Google credentials
-        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > /tmp/gcp_key.json
+        run: pip install --quiet requests google-genai
 
       - name: Get PR diff
         run: |
@@ -36,8 +33,7 @@ jobs:
 
       - name: Gemini review
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp_key.json
-          GCP_PROJECT_ID: "pr-review-bot-501208"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}

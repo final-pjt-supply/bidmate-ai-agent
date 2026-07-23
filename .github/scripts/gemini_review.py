@@ -1,4 +1,4 @@
-"""PR diff를 Vertex AI Gemini로 리뷰하고 PR에 요약 코멘트를 답니다.
+"""PR diff를 Gemini API로 리뷰하고 PR에 요약 코멘트를 답니다.
 GitHub Actions(gemini-pr-review.yml)에서 호출됩니다.
 """
 import os
@@ -12,7 +12,6 @@ PR = os.environ["PR_NUMBER"]
 REPO = os.environ["REPO"]
 TITLE = os.environ.get("PR_TITLE", "")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-PROJECT_ID = os.environ["GCP_PROJECT_ID"]
 MARKER = "<!-- gemini-pr-review -->"
 
 # 1) diff 읽기
@@ -61,12 +60,8 @@ PR 제목: {TITLE}
 if truncated:
     prompt += "\n\n(참고: diff가 너무 커서 일부만 전달되었습니다.)"
 
-# 3) Vertex AI Gemini 호출
-client = genai.Client(
-    vertexai=True,
-    project=PROJECT_ID,
-    location="us-central1",
-)
+# 3) Gemini 호출
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 response = client.models.generate_content(model=MODEL, contents=prompt)
 review = response.text
 
