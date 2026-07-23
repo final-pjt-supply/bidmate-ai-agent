@@ -13,9 +13,19 @@ OpenSearch 검색은 bid_id와 청크 원문만 돌려준다. 사용자에게 �
 from __future__ import annotations
 
 from agents.clients.postgres import get_cursor
-from agents.schemas import BidInfo
+from agents.schemas import Filters
+from agents.tools.search_types import BidInfo
 
 # 조회할 컬럼. 추천 목록 표시에 필요한 것만 추린다.
+# 마감 전 판정 조건. bid_clse_dt는 KST naive이므로 NOW()를 그대로 쓰면
+# 세션 시간대(UTC/KST)에 따라 결과가 달라진다.
+_OPEN_CONDITION = (
+    "(bid_clse_dt IS NULL OR bid_clse_dt > (NOW() AT TIME ZONE 'Asia/Seoul'))"
+)
+
+# bid_table.bid_category 허용값 (업무구분)
+_WORK_CATEGORIES = {"cnstwk", "servc", "thng", "frgcpt"}
+
 _COLUMNS = """
     bid_id, bid_ntce_no, bid_ntce_ord,
     bid_ntce_nm, bid_category,
@@ -138,6 +148,96 @@ def open_bid_ids(
         FROM bid_table
         WHERE {' AND '.join(where)}
         ORDER BY bid_ntce_no, bid_ntce_ord DESC
+        LIMIT %s
+    """
+    params.append(limit)
+
+    with get_cursor() as cur:
+        cur.execute(sql, params)
+        return [row["bid_id"] for row in cur.fetchall()]
+
+
+def resolve_filters(
+    filters: Filters | None = None,
+    *,
+    only_open: bool = True,
+    latest_ord_only: bool = True,
+    limit: int = 20000,
+) -> list[str] | None:
+    """팀 계약의 Filters를 bid_table 조회로 해석해 bid_id 목록을 만든다.
+
+    검색 전에 이 목록을 OpenSearch bid_id 필터로 넘기면, 조건에 맞는 공고
+    안에서만 검색하게 되어 "검색 후 걸러내기"의 낭비가 없어진다.
+
+    처리 범위
+        bid_ids              그대로 사용 (교집합)
+        deadline_within_days bid_clse_dt 기준 N일 이내
+        budget_min/max       presmpt_prce 범위
+        category             bid_category (주의: 아래 미결 참조)
+        region               미구현 (아래 미결 참조)
+
+    미결 사항
+        - Filters.category는 '업종'이고 bid_table.bid_category는
+          업무구분(cnstwk/servc/thng/frgcpt)이다. 같은 개념인지 B와 확인 필요.
+          현재는 업무구분 코드로 들어온 경우에만 적용한다.
+        - Filters.region(시도명)은 bid_table의 region_limit_names(자격 제한 지역)
+          / cnstrtsite_rgn_nm(공사현장 지역) 중 어느 것에 매핑할지 미정.
+          자격 판정 영역이므로 B와 합의 후 구현.
+
+    Returns:
+        조건에 맞는 bid_id 목록. 조건이 하나도 없고 only_open도 False면 None
+        (= 전체 검색).
+    """
+    where: list[str] = []
+    params: list[object] = []
+
+    if only_open:
+        where.append(_OPEN_CONDITION)
+
+    if filters is not None:
+        if filters.bid_ids:
+            where.append("bid_id = ANY(%s)")
+            params.append(filters.bid_ids)
+
+        if filters.deadline_within_days is not None:
+            where.append(
+                "bid_clse_dt IS NOT NULL "
+                "AND bid_clse_dt <= (NOW() AT TIME ZONE 'Asia/Seoul') "
+                "+ make_interval(days => %s)"
+            )
+            params.append(filters.deadline_within_days)
+
+        if filters.budget_min is not None:
+            where.append("presmpt_prce >= %s")
+            params.append(filters.budget_min)
+
+        if filters.budget_max is not None:
+            where.append("presmpt_prce <= %s")
+            params.append(filters.budget_max)
+
+        if filters.category and filters.category in _WORK_CATEGORIES:
+            where.append("bid_category = %s")
+            params.append(filters.category)
+
+    if not where:
+        return None
+
+    order = (
+        "ORDER BY bid_ntce_no, bid_ntce_ord DESC"
+        if latest_ord_only
+        else "ORDER BY bid_ntce_no"
+    )
+    select = (
+        "SELECT DISTINCT ON (bid_ntce_no) bid_id"
+        if latest_ord_only
+        else "SELECT bid_id"
+    )
+
+    sql = f"""
+        {select}
+        FROM bid_table
+        WHERE {' AND '.join(where)}
+        {order}
         LIMIT %s
     """
     params.append(limit)

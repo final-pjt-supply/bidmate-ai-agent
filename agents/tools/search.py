@@ -18,7 +18,14 @@ from __future__ import annotations
 from agents.clients.embedding import embed_query
 from agents.clients.opensearch import get_client
 from agents.config import get_settings
-from agents.schemas import BidHit, BidSearchResult, Chunk, RecommendedBid, SearchResult
+from agents.schemas import Chunk, Filters
+from agents.tools.search_types import (
+    BidHit,
+    BidSearchResult,
+    RecommendedBid,
+    SearchHit,
+    SearchResult,
+)
 
 # knn 후보 폭의 기본 배수는 config(KNN_CANDIDATE_MULTIPLIER)에서 읽는다.
 # 정규화 하이브리드에서는 이 값이 중요하다: 후보가 적으면 knn 결과와 BM25 결과의
@@ -149,17 +156,21 @@ def _build_hybrid_query(
     }
 
 
-def _to_chunk(hit: dict) -> Chunk:
+def _to_hit(hit: dict) -> SearchHit:
+    """OpenSearch 응답 1건을 공용 Chunk + 점수로 변환한다.
+
+    공용 계약의 Chunk에는 score가 없으므로 SearchHit으로 감싼다.
+    """
     src = hit["_source"]
-    return Chunk(
-        chunk_id=hit["_id"],
+    chunk = Chunk(
         bid_id=src["bid_id"],
         document_id=src.get("document_id", ""),
+        file_id=src.get("file_id", ""),
         chunk_idx=src.get("chunk_idx", 0),
         text=src.get("text", ""),
         type=src.get("type", ""),
-        score=hit["_score"],
     )
+    return SearchHit(chunk=chunk, score=hit["_score"])
 
 
 def _run_search(
@@ -172,8 +183,8 @@ def _run_search(
     bm25_weight: float | None,
     normalize: bool | None = None,
     knn_multiplier: int | None = None,
-) -> tuple[list[Chunk], int]:
-    """공통 검색 실행부. (청크 리스트, 전체 매칭 수)를 반환한다.
+) -> tuple[list[SearchHit], int]:
+    """공통 검색 실행부. (검색 결과 리스트, 전체 매칭 수)를 반환한다.
 
     normalize=True면 정규화 하이브리드(임시 pipeline), False면 bool 병합.
     None이면 설정 기본값(USE_NORMALIZATION)을 따른다.
@@ -199,10 +210,10 @@ def _run_search(
     resp = get_client().search(index=s.opensearch_index, body=body)
 
     hits = resp.get("hits", {})
-    chunks = [_to_chunk(h) for h in hits.get("hits", [])]
+    results = [_to_hit(h) for h in hits.get("hits", [])]
     total = hits.get("total", {})
     total_hits = total.get("value", 0) if isinstance(total, dict) else int(total or 0)
-    return chunks, total_hits
+    return results, total_hits
 
 
 def search_bids(
@@ -233,10 +244,10 @@ def search_bids(
     """
     query = (query or "").strip()
     if not query:
-        return SearchResult(query=query, chunks=[], total_hits=0)
+        return SearchResult(query=query, hits=[], total_hits=0)
 
     top_k = top_k or get_settings().default_top_k
-    chunks, total_hits = _run_search(
+    hits, total_hits = _run_search(
         query,
         size=top_k,
         bid_ids=bid_ids,
@@ -246,23 +257,23 @@ def search_bids(
         normalize=normalize,
         knn_multiplier=knn_multiplier,
     )
-    return SearchResult(query=query, chunks=chunks, total_hits=total_hits)
+    return SearchResult(query=query, hits=hits, total_hits=total_hits)
 
 
-def _dedupe_by_bid(chunks: list[Chunk]) -> list[BidHit]:
-    """점수 내림차순 청크 리스트를 bid_id 기준으로 묶어 공고 단위로 만든다.
+def _dedupe_by_bid(hits: list[SearchHit]) -> list[BidHit]:
+    """점수 내림차순 결과를 bid_id 기준으로 묶어 공고 단위로 만든다.
 
     각 공고의 첫(=최고점) 청크가 대표가 되고, 해당 공고에서 걸린 청크 수를 센다.
-    입력이 이미 점수 내림차순이므로, 처음 만난 bid_id의 청크가 곧 최고점이다.
+    입력이 이미 점수 내림차순이므로, 처음 만난 bid_id가 곧 최고점이다.
     """
     by_bid: dict[str, BidHit] = {}
-    for c in chunks:
-        existing = by_bid.get(c.bid_id)
+    for h in hits:
+        existing = by_bid.get(h.bid_id)
         if existing is None:
-            by_bid[c.bid_id] = BidHit(
-                bid_id=c.bid_id,
-                score=c.score,
-                top_chunk=c,
+            by_bid[h.bid_id] = BidHit(
+                bid_id=h.bid_id,
+                score=h.score,
+                top_hit=h,
                 matched_chunks=1,
             )
         else:
@@ -305,7 +316,7 @@ def search_bids_grouped(
     # 중복 제거 후에도 top_k개 공고가 남도록 넉넉히 청크를 뽑는다.
     fetch_size = top_k * _DEDUPE_OVERFETCH
 
-    chunks, total_hits = _run_search(
+    hits, total_hits = _run_search(
         query,
         size=fetch_size,
         bid_ids=bid_ids,
@@ -316,43 +327,43 @@ def search_bids_grouped(
         knn_multiplier=knn_multiplier,
     )
 
-    bids = _dedupe_by_bid(chunks)[:top_k]
+    bids = _dedupe_by_bid(hits)[:top_k]
     return BidSearchResult(query=query, bids=bids, total_hits=total_hits)
 
 
 def recommend_bids(
     query: str,
     *,
+    filters: Filters | None = None,
     top_k: int | None = None,
     types: list[str] | None = None,
-    category: str | None = None,
     only_open: bool = True,
     latest_ord_only: bool = True,
 ) -> list[RecommendedBid]:
     """추천 공고 목록을 만든다: 검색(OpenSearch) + 공고 정보(PostgreSQL).
 
     흐름
-      1) PostgreSQL에서 유효 공고(마감 전 + 최신 차수) bid_id 목록을 먼저 구한다
+      1) Filters를 bid_table 조회로 해석해 대상 bid_id 목록을 먼저 구한다
       2) 그 목록을 필터로 넘겨 하이브리드 검색 → 버려지는 결과가 없다
       3) bid_id 기준 중복 제거 (공고당 1건)
       4) bid_table에서 공고명·기관·마감일 등을 채운다
 
-    1번을 먼저 하는 이유: 색인된 공고 상당수가 이미 마감된 상태라,
+    1번을 먼저 하는 이유: 색인 공고 상당수가 이미 마감된 상태라,
     "검색 후 걸러내기" 방식은 후보 대부분이 탈락해 결과가 빈약해진다.
     (실측 생존율 약 10%)
 
     Args:
-        query: 사용자 질의.
+        query: 사용자 질의 (Router의 normalized_query).
+        filters: 팀 계약의 Filters. 마감·예산·업종·bid_ids를 검색 범위에 반영.
         top_k: 반환할 공고 수. None이면 설정 기본값.
-        types: 청크 종류 필터.
-        category: 업무구분 필터 (cnstwk/servc/thng/frgcpt).
+        types: 청크 종류 필터 (text/table/box).
         only_open: True면 마감 지난 공고를 제외한다.
         latest_ord_only: True면 같은 공고번호 중 최신 차수만 남긴다.
 
     Returns:
         RecommendedBid 목록 (검색 점수 내림차순).
     """
-    from agents.tools.bid_info import fetch_bid_info, open_bid_ids
+    from agents.tools.bid_info import fetch_bid_info, resolve_filters
 
     query = (query or "").strip()
     if not query:
@@ -360,35 +371,26 @@ def recommend_bids(
 
     top_k = top_k or get_settings().default_top_k
 
-    # 1) 검색 대상을 유효 공고로 미리 좁힌다
-    allowed: list[str] | None = None
-    if only_open or category:
-        allowed = open_bid_ids(category=category)
-        if not allowed:
-            return []
+    # 1) 검색 대상을 조건에 맞는 공고로 미리 좁힌다
+    allowed = resolve_filters(
+        filters,
+        only_open=only_open,
+        latest_ord_only=latest_ord_only,
+    )
+    if allowed is not None and not allowed:
+        return []
 
-    # 2) 좁혀진 범위에서 검색 (여유분은 청크 중복 제거용으로만 필요)
+    # 2) 좁혀진 범위에서 검색 (여유분은 청크 중복 제거용)
     search_result = search_bids_grouped(
         query,
         bid_ids=allowed,
         types=types,
         top_k=top_k * _RECOMMEND_OVERFETCH,
     )
-    hits = search_result.bids
+    hits = search_result.bids[:top_k]
     if not hits:
         return []
 
-    # 3) 사전 필터를 안 쓴 경우에만 사후 차수 필터를 적용
-    if latest_ord_only and allowed is None:
-        from agents.tools.bid_info import latest_ord_map
-
-        latest = set(latest_ord_map([h.bid_id for h in hits]).values())
-        hits = [h for h in hits if h.bid_id in latest]
-
-    hits = hits[:top_k]
-    if not hits:
-        return []
-
-    # 4) 공고 메타 채우기 (한 번의 쿼리)
+    # 3) 공고 메타 채우기 (한 번의 쿼리)
     info_map = fetch_bid_info([h.bid_id for h in hits])
     return [RecommendedBid(hit=h, info=info_map.get(h.bid_id)) for h in hits]
