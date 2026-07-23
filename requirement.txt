@@ -1,0 +1,5 @@
+langgraph
+pydantic>=2
+boto3
+python-dotenv
+pytest
