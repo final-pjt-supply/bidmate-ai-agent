@@ -8,7 +8,9 @@
     <아무 문장>          추천 목록 (검색 + 공고 정보)
     /search <질의>       청크 단위 RAG 검색 (근거 원문 확인)
     /rec <질의>          추천 목록 (명시적)
-    /set <키> <값>       옵션 변경 (top_k, open, ord)
+    /set <키> <값>       옵션 변경
+                         top_k, open, ord, agg(max|sum_topn),
+                         topn, minscore, minchunks
     /stats               유효 공고 수 확인 (데이터 진단)
     /help                도움말
     /quit                종료
@@ -28,8 +30,12 @@ from agents.tools.search import recommend_bids, search_bids
 
 OPTS = {
     "top_k": 5,
-    "open": True,   # 마감 지난 공고 제외
-    "ord": True,    # 최신 차수만
+    "open": True,        # 마감 지난 공고 제외
+    "ord": True,         # 최신 차수만
+    "agg": "sum_topn",   # 집계: max | sum_topn
+    "topn": 5,           # 합산에 쓸 청크 수
+    "minscore": 0.0,     # 점수 하한선 (0=미적용)
+    "minchunks": 1,      # 최소 걸린 청크 수
 }
 
 CATEGORY_NAMES = {
@@ -74,6 +80,10 @@ def cmd_recommend(query: str) -> None:
         top_k=OPTS["top_k"],
         only_open=OPTS["open"],
         latest_ord_only=OPTS["ord"],
+        aggregate=OPTS["agg"],
+        sum_top_n=OPTS["topn"],
+        min_score=OPTS["minscore"],
+        min_chunks=OPTS["minchunks"],
     )
     print(f"\n[추천 목록] 공고 {len(recs)}건")
     print("-" * 70)
@@ -91,7 +101,8 @@ def cmd_recommend(query: str) -> None:
         print(f"      마감 {fmt_dt(info.bid_clse_dt)} | 추정가 {fmt_money(info.presmpt_prce)}")
         if info.cntrct_cncls_mthd_nm:
             print(f"      {info.cntrct_cncls_mthd_nm} / {info.sucsfbid_mthd_nm or '-'}")
-        print(f"      {info.bid_id} | 걸린 청크 {r.hit.matched_chunks}개")
+        print(f"      {info.bid_id} | 청크 {r.hit.matched_chunks}개"
+              f"(합산 {r.hit.summed_chunks}) | 최고 {r.hit.max_score:.3f}")
 
 
 def cmd_stats() -> None:
@@ -116,8 +127,21 @@ def cmd_set(args: list[str]) -> None:
         OPTS["top_k"] = max(1, min(int(raw), 50))
     elif key in ("open", "ord"):
         OPTS[key] = raw in ("true", "1", "on", "y")
+    elif key == "agg" and raw in ("max", "sum_topn"):
+        OPTS["agg"] = raw
+    elif key == "topn" and raw.isdigit():
+        OPTS["topn"] = max(1, int(raw))
+    elif key == "minchunks" and raw.isdigit():
+        OPTS["minchunks"] = max(1, int(raw))
+    elif key == "minscore":
+        try:
+            OPTS["minscore"] = float(raw)
+        except ValueError:
+            print("  minscore는 숫자여야 합니다")
+            return
     else:
-        print("  사용법: /set top_k 10 | /set open false | /set ord true")
+        print("  사용법: /set top_k 10 | /set agg sum_topn | /set topn 5")
+        print("          /set minscore 1.5 | /set minchunks 2 | /set open false")
         return
     print(f"  옵션 변경됨: {OPTS}")
 
