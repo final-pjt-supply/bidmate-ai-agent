@@ -7,6 +7,12 @@
 
 실행: python tune_threshold.py
 """
+import sys
+from pathlib import Path
+
+# 프로젝트 루트를 import 경로에 추가 — 하위 폴더에서 실행해도 agents를 찾는다
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from agents.tools.search import recommend_bids
 
 # 검색으로 답할 수 있는 질의 (결과가 남아야 함)

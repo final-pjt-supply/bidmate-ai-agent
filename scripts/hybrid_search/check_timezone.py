@@ -7,6 +7,10 @@
 
 실행: python check_timezone.py
 """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from datetime import datetime, timedelta, timezone
 
 from agents.clients.postgres import get_cursor

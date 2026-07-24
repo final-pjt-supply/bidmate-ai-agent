@@ -23,6 +23,12 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# 프로젝트 루트를 import 경로에 추가 — 하위 폴더에서 실행해도 agents를 찾는다
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import sys
 import traceback
 
 from agents.tools.bid_info import open_bid_ids
@@ -90,7 +96,10 @@ def cmd_recommend(query: str) -> None:
     print(f"\n[추천 목록] 공고 {len(recs)}건")
     print("-" * 70)
     if not recs:
-        print("  (결과 없음 — /set open false 로 마감 필터를 꺼보세요)")
+        print("  (관련 공고를 찾지 못했습니다)")
+        print(f"   하한선: 점수 {OPTS['minscore']} / 1위대비 {OPTS['ratio']} "
+              f"/ 최소청크 {OPTS['minchunks']}")
+        print("   → /set minscore 0 /set ratio 0 으로 끄고 확인 가능")
         return
     for i, r in enumerate(recs, 1):
         info = r.info

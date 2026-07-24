@@ -4,6 +4,12 @@
 
 실행: python compare_normalization.py
 """
+import sys
+from pathlib import Path
+
+# 프로젝트 루트를 import 경로에 추가 — 하위 폴더에서 실행해도 agents를 찾는다
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from agents.tools.search import search_bids
 
 QUERIES = [
