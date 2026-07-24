@@ -1,7 +1,15 @@
-"""[4] 응답 생성 — 신호를 자연어로 조립. 수치 계산 금지, 렌더링만."""
+"""[4] 응답 생성 — 신호를 자연어로 조립. 수치 계산 금지, 렌더링만.
+
+출력 통제(ADR 0006): LLM은 RespondOutput 슬롯(내용)만 채우고, 최종 답변 문자열의
+양식은 render_answer()가 결정적으로 조립한다. 문서 발췌(제3자 작성)를 통한 간접
+프롬프트 인젝션이 성공해도 산출물이 슬롯 밖으로 나갈 수 없다.
+"""
+import json
 import logging
 import re
 from pathlib import Path
+
+from pydantic import BaseModel
 
 from agents import llm
 from agents.llm import ModelTier
@@ -14,6 +22,46 @@ _PROMPT = (Path(__file__).parent.parent / "prompts" / "respond.md").read_text(
     encoding="utf-8")
 _NUM_RE = re.compile(r"\d+(?:[,.]\d+)*")
 _DATE_TOKEN_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$")
+
+# 출력 위생 — 악성 문서 발췌가 슬롯으로 흘러들어도 프론트에서 실행 가능한
+# 형태(HTML 태그=XSS, 링크/이미지=대화 내용 유출 채널)로 나가지 않게 한다.
+_MD_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")   # [t](u)·![t](u) → t
+_TAG_RE = re.compile(r"<[^>]+>")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+class BidItem(BaseModel):
+    """공고 1건 설명 슬롯 — respond 내부 전용(팀 계약 아님)."""
+    bid_id: str
+    text: str
+
+
+class RespondOutput(BaseModel):
+    """LLM이 채우는 내용 슬롯. 전 필드 required — 구조화 출력 스키마에서
+    선택 필드를 남기지 않는다(누락 폴백 분기 자체를 없앤다)."""
+    headline: str
+    items: list[BidItem]
+    caveat: str | None
+
+
+def sanitize(text: str) -> str:
+    """URL·HTML 태그·마크다운 링크 제거. 프롬프트로 막고(respond.md 절대 규칙)
+    여기서 한 번 더 거른다 — 프롬프트는 확률, 이 함수는 보장."""
+    cleaned = _MD_LINK_RE.sub(r"\1", text)
+    cleaned = _TAG_RE.sub("", cleaned)
+    cleaned = _URL_RE.sub("", cleaned)
+    if cleaned != text:
+        logger.warning("sanitize: 답변 슬롯에서 링크/태그 제거됨")
+    return cleaned.strip()
+
+
+def render_answer(out: RespondOutput) -> str:
+    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 목록 → 참고 순, 결정적."""
+    lines = [sanitize(out.headline)]
+    lines += [f"- {sanitize(i.bid_id)}: {sanitize(i.text)}" for i in out.items]
+    if out.caveat:
+        lines.append(f"참고: {sanitize(out.caveat)}")
+    return "\n".join(line for line in lines if line)
 
 
 def _eligibility_block(state) -> str:
@@ -77,6 +125,14 @@ def build_summary(state) -> str:
     return f"직전 턴: 공고 {len(bids)}건 안내 (조건: {', '.join(keys) or '없음'})"
 
 
+def _fallback_answer(state) -> str:
+    """그라운딩 재생성까지 실패하면 생성문 대신 신호 원문만 안내한다.
+    발췌는 신호 그 자체라 정의상 그라운딩 위반이 불가능하다(안전 우선)."""
+    chunks = "\n".join(f"- {sanitize(c.text)}" for c in state["chunks"])
+    return ("답변 생성 중 확인되지 않은 수치가 반복 감지되어, 확인된 공고 "
+            "원문 발췌를 그대로 안내합니다.\n" + (chunks or "(발췌 없음)"))
+
+
 @node_logger("respond")
 def respond_node(state: dict) -> dict:
     signals = "\n".join([_eligibility_block(state), _scores_block(state),
@@ -87,13 +143,29 @@ def respond_node(state: dict) -> dict:
         chunks_block=_chunks_block(state),
         query=state["query"],
     )
-    answer = llm.invoke(ModelTier.SYNTHESIS,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=1500)
+    messages = [{"role": "user", "content": prompt}]
 
-    violations = check_grounding(answer, signals)
-    if violations:
-        logger.warning("grounding 위반 탐지: %s", violations)
+    answer = None
+    for attempt in (1, 2):                 # 위반 시 위반 목록을 붙여 1회 재생성
+        raw = llm.invoke(ModelTier.SYNTHESIS, messages=messages,
+                         max_tokens=1500,
+                         output_schema=RespondOutput.model_json_schema())
+        candidate = render_answer(RespondOutput.model_validate(raw))
+        violations = check_grounding(candidate, signals)
+        if not violations:
+            answer = candidate
+            break
+        logger.warning("grounding 위반 탐지(attempt=%d): %s", attempt, violations)
+        messages = messages + [
+            {"role": "assistant",
+             "content": json.dumps(raw, ensure_ascii=False)},
+            {"role": "user",
+             "content": "다음 수치는 신호에 없다: " + ", ".join(violations)
+                        + ". 신호에 있는 수치만 사용해 다시 작성하라."},
+        ]
+    if answer is None:
+        logger.warning("grounding 재생성 실패 — 원문 발췌 폴백으로 대체")
+        answer = _fallback_answer(state)
 
     citations = [Citation(bid_id=c.bid_id, file_id=c.file_id,
                           chunk_idx=c.chunk_idx, text=c.text)

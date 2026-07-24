@@ -121,14 +121,17 @@ def test_polluted_prev_bid_ids_cannot_survive_scope_release():
 
 # ---- run_agent E2E (LLM은 monkeypatch) ----
 
-def _mock_llm(monkeypatch, router_payload,
-              respond_text="여유율 2.5배로 자격을 충족합니다."):
+def _mock_llm(monkeypatch, router_payload, respond_payload=None):
     """router·respond 둘 다 같은 agents.llm 모듈을 쓰므로 patch는 하나만 —
-    두 번 걸면 마지막 것이 이겨서 Router가 산문을 받아 ValidationError가 난다.
-    티어로 분기해 ROUTER=dict, SYNTHESIS=str을 돌려준다."""
+    두 번 걸면 마지막 것이 이겨서 분기가 깨진다. 티어로 분기해 ROUTER/SYNTHESIS
+    각각의 구조화 출력 dict를 돌려준다."""
+    if respond_payload is None:
+        respond_payload = {"headline": "여유율 2.5배로 자격을 충족합니다.",
+                           "items": [], "caveat": None}
+
     def fake_invoke(tier, messages, system=None, max_tokens=1024,
                     output_schema=None):
-        return router_payload if tier == ModelTier.ROUTER else respond_text
+        return router_payload if tier == ModelTier.ROUTER else respond_payload
     monkeypatch.setattr(router_mod.llm, "invoke", fake_invoke)
 
 
