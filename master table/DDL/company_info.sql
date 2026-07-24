@@ -6,7 +6,8 @@
 -- 대칭: 공고 측 bid_require_* 9축과 회원 측 보유 데이터가 코드로 매칭.
 --       규모·신용은 공고 측만 자식 테이블화, 회원 측은 company_qualifications 1:1 컬럼 유지
 --       (회사 속성은 본래 1:1이므로 위성 테이블 불필요 — 비대칭이 정상).
--- 표준명 미저장: 회원 테이블은 code만, 이름은 마스터 조인(뷰).
+-- 표준명 병기: 회원 테이블도 code+이름 함께 저장 (공고 측 bid_require_*와 대칭, 뷰 폐지).
+--   이름은 매칭 키가 아닌 표시용 — 코드가 정본, 이름은 쓰기 시점에 마스터에서 채운다.
 -- ============================================================================
 
 -- 계정 (백엔드 확정)
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS company_qualifications (
 CREATE TABLE IF NOT EXISTS company_licenses (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   license_code VARCHAR(20) NOT NULL REFERENCES license_master(license_code),
+  license_name VARCHAR(100),                    -- 표준명 병기 (쓰기 시 마스터에서 채움)
   PRIMARY KEY (company_id, license_code)
 );
 
@@ -40,6 +42,7 @@ CREATE TABLE IF NOT EXISTS company_licenses (
 CREATE TABLE IF NOT EXISTS company_regions (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   region_code VARCHAR(10) NOT NULL REFERENCES region_master(region_code),
+  region_name VARCHAR(60),                       -- 표준명 병기
   region_type VARCHAR(10) NOT NULL CHECK (region_type IN ('hq','branch')),
   PRIMARY KEY (company_id, region_code)
 );
@@ -49,6 +52,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_company_regions_hq ON company_regions (comp
 CREATE TABLE IF NOT EXISTS company_personnel (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   qual_code VARCHAR(20) NOT NULL REFERENCES personnel_grade_master(qual_code),
+  qual_name VARCHAR(100),                        -- 표준명 병기
   headcount SMALLINT NOT NULL CHECK (headcount > 0),
   PRIMARY KEY (company_id, qual_code)
 );
@@ -57,6 +61,7 @@ CREATE TABLE IF NOT EXISTS company_personnel (
 CREATE TABLE IF NOT EXISTS company_items (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   item_code VARCHAR(10) NOT NULL REFERENCES item_code_master(item_code),
+  item_name VARCHAR(200),                        -- 표준명 병기
   has_direct_production BOOLEAN NOT NULL DEFAULT FALSE,
   direct_prod_valid_until DATE,
   PRIMARY KEY (company_id, item_code)
@@ -68,6 +73,7 @@ CREATE TABLE IF NOT EXISTS company_performance_records (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   contract_name VARCHAR(200) NOT NULL,
   field_code VARCHAR(20) REFERENCES license_master(license_code),
+  field_name VARCHAR(100),                       -- 분야 표준명 병기
   contract_amt BIGINT NOT NULL CHECK (contract_amt >= 0),
   end_date DATE NOT NULL
 );
@@ -77,6 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_cpr_company ON company_performance_records (compa
 CREATE TABLE IF NOT EXISTS company_certs (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   cert_code VARCHAR(30) NOT NULL REFERENCES cert_master(cert_code),
+  cert_name VARCHAR(100),                        -- 표준명 병기
   valid_until DATE,
   PRIMARY KEY (company_id, cert_code)
 );
@@ -85,25 +92,16 @@ CREATE TABLE IF NOT EXISTS company_certs (
 CREATE TABLE IF NOT EXISTS company_capacity_evals (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   license_code VARCHAR(20) NOT NULL REFERENCES license_master(license_code),
+  license_name VARCHAR(100),                    -- 표준명 병기
   eval_amount BIGINT NOT NULL CHECK (eval_amount >= 0),
   eval_year SMALLINT,
   PRIMARY KEY (company_id, license_code)
 );
 CREATE INDEX IF NOT EXISTS idx_cce_company ON company_capacity_evals (company_id);
 
--- 표준명 조회 뷰 (테이블은 code만 저장, 이름은 여기서 조인)
-CREATE OR REPLACE VIEW vw_company_licenses AS
-  SELECT cl.company_id, cl.license_code, lm.license_name FROM company_licenses cl JOIN license_master lm USING (license_code);
-CREATE OR REPLACE VIEW vw_company_regions AS
-  SELECT cr.company_id, cr.region_code, cr.region_type, rm.region_name FROM company_regions cr JOIN region_master rm USING (region_code);
-CREATE OR REPLACE VIEW vw_company_personnel AS
-  SELECT cp.company_id, cp.qual_code, pg.qual_name, cp.headcount FROM company_personnel cp JOIN personnel_grade_master pg USING (qual_code);
-CREATE OR REPLACE VIEW vw_company_items AS
-  SELECT ci.company_id, ci.item_code, im.item_name, ci.has_direct_production, ci.direct_prod_valid_until FROM company_items ci JOIN item_code_master im USING (item_code);
-CREATE OR REPLACE VIEW vw_company_certs AS
-  SELECT cc.company_id, cc.cert_code, cm.cert_name, cm.category, cc.valid_until FROM company_certs cc JOIN cert_master cm USING (cert_code);
-CREATE OR REPLACE VIEW vw_company_capacity_evals AS
-  SELECT ce.company_id, ce.license_code, lm.license_name, ce.eval_amount, ce.eval_year FROM company_capacity_evals ce JOIN license_master lm USING (license_code);
+-- (뷰 폐지) 표준명을 각 테이블에 병기 저장하므로 조회용 뷰 불필요 — 공고 측 bid_require_*와 대칭.
+--   이름은 표시용이고 코드가 정본이다. 마스터 표준명이 개정되면(드묾) 병기 이름은
+--   재동기화 대상 — 쓰기 시 마스터 조인으로 채우고, 필요 시 주기적 갱신 배치로 최신화한다.
 
 
 -- ═══════════════════════════════════════════════════════════

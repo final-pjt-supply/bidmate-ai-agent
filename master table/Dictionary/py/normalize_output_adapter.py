@@ -152,8 +152,8 @@ def parse_capacity(req: dict, norm: Any, ctx: Any) -> dict:
     lic = None
     if name:                    # 업종명이 붙어 있으면 면허 정규화로 코드 시도
         res = norm.normalize_license(name, ctx)
-        if res.codes and res.method in _LICENSE_RESOLVED:
-            lic = res.codes[0]
+        if res.codes and res.method in _LICENSE_RESOLVED and res.codes[0] in ctx.license_codes:
+            lic = res.codes[0]  # 마스터에 실재하는 코드만 (FK 위반 방지)
     parsed = min_value is not None
     return {
         "capacity_type": "시공능력평가액",
@@ -207,10 +207,17 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
         "normalizer_version": NORMALIZER_VERSION,
     })
 
+    # 마스터에 없는 코드는 NULL로 강등(확인필요) — FK 위반 방지.
+    #   normalizer 일부 경로(면허칸 route:item 등)가 존재 확인 없이 코드를 뽑을 수 있어,
+    #   적재 직전 마스터 멤버십(=FK 대상 집합)으로 최종 가드한다. 원문은 name_raw로 보존.
+    def _fk(code, names):
+        return code if (code is not None and code in names) else None
+
     # 품목 적재 헬퍼 (코드 dedup — 면허칸 교차이동 + 물품칸 중복 방지)
     dp_req = bool(bid.get("direct_production_req"))
     _item_seen: set = set()
     def _emit_item(code, method, source, name_raw):
+        code = _fk(code, mn.item)
         if code is not None:
             if code in _item_seen:
                 return
@@ -225,7 +232,8 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
     # 인증 적재 헬퍼 (코드 dedup — 면허칸 구제분 + required_certs 중복 방지)
     _cert_seen: set = set()
     def _emit_cert(row):
-        code = row.get("cert_code")
+        code = _fk(row.get("cert_code"), mn.cert)
+        row["cert_code"], row["cert_name"] = code, (mn.cert.get(code) if code else None)
         if code is not None:
             if code in _cert_seen:
                 return
@@ -248,10 +256,11 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
                 _emit_cert(cr)
             continue
         grp = str(req_idx)
-        for code in (res.codes or [None]):   # 미해석(none) → NULL 1행 (확인필요 표면화)
+        for code in (res.codes or [None]):   # 미해석·마스터부재 → NULL 1행 (확인필요 표면화)
+            lc = _fk(code, mn.license)
             out["licenses"].append({
                 "bid_ntce_no": no, "bid_ntce_ord": ord_, "or_group": grp,
-                "license_code": code, "license_name": mn.license.get(code) if code else None,
+                "license_code": lc, "license_name": mn.license.get(lc) if lc else None,
                 "method": res.method, "source": "license_field",
                 "qualifier": res.qualifier or None, "name_raw": raw,
             })
@@ -264,7 +273,7 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
             continue
         flag = ("nationwide" if res.method == "special:nationwide"
                 else "site_ref" if res.method == "special:site_ref" else None)
-        code = res.codes[0] if res.codes else None
+        code = _fk(res.codes[0] if res.codes else None, mn.region)
         out["regions"].append({
             "bid_ntce_no": no, "bid_ntce_ord": ord_, "region_code": code,
             "region_name": mn.region.get(code) if code else None,
@@ -275,7 +284,7 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
     for req in (bid.get("personnel_reqs") or []):
         grade = req.get("grade"); rfield = req.get("field"); cnt = req.get("count")
         res = norm.normalize_personnel_grade(grade, ctx)
-        code = res.codes[0] if res.codes else None
+        code = _fk(res.codes[0] if res.codes else None, mn.personnel)
         out["personnel"].append({
             "bid_ntce_no": no, "bid_ntce_ord": ord_, "qual_code": code,
             "qual_name": mn.personnel.get(code) if code else None,
@@ -294,9 +303,10 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
         if res.method == "route:license":    # 물품칸에 기재된 업종 → 면허 축으로 교차 이동
             _lic_xr += 1
             for code in (res.codes or [None]):
+                lc = _fk(code, mn.license)
                 out["licenses"].append({
                     "bid_ntce_no": no, "bid_ntce_ord": ord_, "or_group": f"x{_lic_xr}",
-                    "license_code": code, "license_name": mn.license.get(code) if code else None,
+                    "license_code": lc, "license_name": mn.license.get(lc) if lc else None,
                     "method": res.method, "source": "item_field",
                     "qualifier": None, "name_raw": str(raw),
                 })
@@ -340,7 +350,7 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
     for req in (bid.get("jntcontrct_duty_rgns") or []):
         raw = (req.get("name_raw") if isinstance(req, dict) else req) or ""
         res = norm.normalize_region(raw, ctx)
-        code = res.codes[0] if res.codes else None
+        code = _fk(res.codes[0] if res.codes else None, mn.region)
         out["region_duty"].append({
             "bid_ntce_no": no, "bid_ntce_ord": ord_, "region_code": code,
             "region_name": mn.region.get(code) if code else None,
@@ -407,17 +417,33 @@ def _dict_row(conn):
     return dict_row
 
 def run(conn, norm: Any, current_version: str = NORMALIZER_VERSION, dry_run: bool = True) -> dict:
+    # autocommit: write_bid의 `with conn.transaction()`이 공고별 독립 트랜잭션으로 커밋되게 한다.
+    #   (비autocommit이면 초기 SELECT가 연 트랜잭션 안에 전 공고가 savepoint로 묶여 = 한 방에 커밋/롤백,
+    #    락도 끝까지 유지. autocommit이 공고 단위 커밋·재개가능·짧은 락을 보장.)
+    if not dry_run:
+        conn.autocommit = True
     mn  = MasterNames.load(conn, norm)
     ctx = build_lookup_context(conn, norm)         # normalizer.LookupContext (1회 구성)
     targets = select_targets(conn, current_version)
     log.info("대상 공고 %d건 (dry_run=%s)", len(targets), dry_run)
     n_bids = n_rows = 0
+    failures: list = []
     for bid in targets:
-        rows = build_rows(bid, norm, mn, ctx)
-        n_rows += write_bid(conn, bid["bid_ntce_no"], bid["bid_ntce_ord"], rows, dry_run)
-        n_bids += 1
-    log.info("완료: 공고 %d건, 행 %d개%s", n_bids, n_rows, " (DRY_RUN — 미기록)" if dry_run else "")
-    return {"bids": n_bids, "rows": n_rows, "dry_run": dry_run}
+        no, ord_ = bid["bid_ntce_no"], bid["bid_ntce_ord"]
+        try:
+            rows = build_rows(bid, norm, mn, ctx)
+            n_rows += write_bid(conn, no, ord_, rows, dry_run)
+            n_bids += 1
+        except Exception as e:                     # 한 공고 실패가 전체를 멈추지 않게 (재실행 시 자동 재시도)
+            failures.append((no, ord_, str(e).splitlines()[0]))
+            log.warning("SKIP %s_%s: %s", no, ord_, str(e).splitlines()[0])
+    log.info("완료: 공고 %d건, 행 %d개, 실패 %d건%s", n_bids, n_rows, len(failures),
+             " (DRY_RUN — 미기록)" if dry_run else "")
+    if failures:
+        head = ", ".join(f"{a}_{b}" for a, b, _ in failures[:20])
+        log.warning("실패 공고 %d건 (미커밋 → 재실행 시 자동 재시도): %s%s",
+                    len(failures), head, " …" if len(failures) > 20 else "")
+    return {"bids": n_bids, "rows": n_rows, "failed": len(failures), "dry_run": dry_run}
 
 
 if __name__ == "__main__":
