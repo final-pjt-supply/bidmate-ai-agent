@@ -1,0 +1,27 @@
+# bidmate-backend가 이 저장소를 pip 패키지로 설치하기 위한 메타데이터.
+# (backend requirements: bidmate-agents @ git+https://github.com/final-pjt-supply/bidmate-ai-agent.git)
+# 근거: docs/adr/0005 — 에이전트는 백엔드 FastAPI 프로세스에 라이브러리로 임베드.
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bidmate-agents"
+version = "0.1.0"
+description = "BidMate 입찰 공고 질의응답 에이전트 (LangGraph + Bedrock Claude)"
+# StrEnum(schemas.py)이 3.11+, 배포 대상은 EC2 Ubuntu 24.04의 Python 3.12.
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+    "pydantic>=2",
+    "boto3",
+    "python-dotenv",
+]
+
+[tool.setuptools]
+# tests/·transforming/ 등은 배포에 포함하지 않는다 — 명시 나열로 고정.
+packages = ["agents", "agents.nodes"]
+
+[tool.setuptools.package-data]
+# 노드가 Path(__file__) 기준으로 읽는 프롬프트 원문 — 빠지면 임포트 시점에 깨진다.
+agents = ["prompts/*.md"]
