@@ -13,6 +13,7 @@ class Region(StrEnum):
     JEJU = "제주"
 
 
+
 class Filters(BaseModel):
     """전 필드 optional — Router는 '언급된 필터만' 채운다(스펙 §병합 규칙)."""
     region: Region | None = None
