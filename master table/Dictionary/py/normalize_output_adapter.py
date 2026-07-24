@@ -36,7 +36,7 @@ from typing import Any
 
 log = logging.getLogger("normalize_adapter")
 
-NORMALIZER_VERSION = "v1.6"   # summary.normalizer_version — 재정규화 레버
+NORMALIZER_VERSION = "v1.7"   # summary.normalizer_version — 재정규화 레버
 
 # ─────────────────────────────────────────────────────────────
 # 상수 (어댑터 소관 규칙)
