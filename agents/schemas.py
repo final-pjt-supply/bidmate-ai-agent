@@ -59,6 +59,10 @@ class FailedReason(BaseModel):
 class EligibilityResult(BaseModel):
     bid_id: str
     passed: bool
+    # 게이트 판정 원문(4-state). passed(bool)로는 '보완가능'과 '불가'가
+    # 똑같이 False로 뭉개져 화면에서 구분이 안 된다 — 원문을 같이 싣는다.
+    # 기본값 None이라 기존 stub·호출부는 무변경으로 그대로 동작한다.
+    verdict: Literal["가능", "불가", "보완가능", "확인필요"] | None = None
     failed_reasons: list[FailedReason] = []
 
 
