@@ -3,6 +3,7 @@ from functools import lru_cache
 
 from agents.graph import build_graph
 from agents.nodes.respond import build_summary, respond_node
+from agents.nodes.retrieval import retrieval_node
 from agents.nodes.router import router_node
 from agents.schemas import (AgentRequest, AgentResponse, Filters,
                             PendingClarify, SessionContext)
@@ -12,7 +13,9 @@ _MAX_BID_IDS = 20
 
 @lru_cache(maxsize=1)
 def _graph():
-    return build_graph(router_node, respond_node)
+    # retrieval은 C 실구현. eligibility·scoring은 B 실구현이 오면 같은 방식으로 주입.
+    return build_graph(router_node, respond_node,
+                       retrieval_node=retrieval_node)
 
 
 def _initial_state(req: AgentRequest) -> dict:
