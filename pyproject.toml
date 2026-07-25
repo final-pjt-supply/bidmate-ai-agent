@@ -14,13 +14,19 @@ requires-python = ">=3.11"
 dependencies = [
     "langgraph",
     "pydantic>=2",
+    "pydantic-settings>=2.2",
     "boto3",
     "python-dotenv",
+    # C 검색 파트 (agents.tools / agents.clients)
+    "opensearch-py>=2.4",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.2",
 ]
 
 [tool.setuptools]
 # tests/·transforming/ 등은 배포에 포함하지 않는다 — 명시 나열로 고정.
-packages = ["agents", "agents.nodes"]
+packages = ["agents", "agents.clients", "agents.nodes", "agents.tools"]
 
 [tool.setuptools.package-data]
 # 노드가 Path(__file__) 기준으로 읽는 프롬프트 원문 — 빠지면 임포트 시점에 깨진다.
