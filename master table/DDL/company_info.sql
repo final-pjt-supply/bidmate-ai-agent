@@ -105,20 +105,23 @@ CREATE INDEX IF NOT EXISTS idx_cce_company ON company_capacity_evals (company_id
 
 
 -- ═══════════════════════════════════════════════════════════
--- 매칭 결과 = bid↔company 유일 연결점 + "자격 N/M 충족"의 정본
+-- 매칭 결과 = bid↔company 유일 연결점 + "자격 N/M 충족"의 정본  (v2.5 · 게이트 3-state)
 --   충족형 9축: 면허·지역·인력·품목(직생)·실적·인증·시공능력·규모·신용
---   required(M)=요구 축 수, satisfied(N)=충족 축 수 (N≤M)
---   verdict: need_review>0→확인필요 / N=M→추천 / N=0→미달 / else→부분충족
---   지명경쟁·공동수급 여부 배지 = bid_require_summary 컬럼에서 직접 표시 (매칭 미참여)
+--   required(M)=요구 있는 '참여 축'(게이트+보완) 수, satisfied(N)=충족 축 수 (N≤M). 인증(info)은 미참여.
+--   verdict 판정 우선순위(정본): ① 게이트 확정 미충족 ≥1 → '불가'
+--     ② 참여 축 확인필요 ≥1 → '확인필요'  ③ 보완 축 미충족 ≥1 → '보완가능'  ④ 그 외 → '가능'
+--     하드게이트: 면허·지역·규모·직생 / 보완: 실적·인력·시공능력·신용·품목(비직생) / 표시: 인증(M2 강등)
+--   gate_failed>0 ↔ '불가' (불가 사유 필터용). 지명경쟁·공동수급 배지는 bid_require_summary에서 직접 표시.
 -- ═══════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS match_results (
   company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
   bid_ntce_no VARCHAR(40) NOT NULL, bid_ntce_ord VARCHAR(10) NOT NULL,
-  verdict VARCHAR(20) NOT NULL CHECK (verdict IN ('추천','부분충족','확인필요','미달')),
-  satisfied SMALLINT NOT NULL CHECK (satisfied >= 0),
-  required SMALLINT NOT NULL CHECK (required >= 0),
-  need_review SMALLINT NOT NULL DEFAULT 0,
-  axes JSONB NOT NULL,                            -- [{axis, required, satisfied, reason}]
+  verdict VARCHAR(20) NOT NULL CHECK (verdict IN ('가능','불가','보완가능','확인필요')),
+  satisfied SMALLINT NOT NULL CHECK (satisfied >= 0),   -- 충족 축 수 (N)
+  required SMALLINT NOT NULL CHECK (required >= 0),      -- 요구 있는 참여 축 수 (M)
+  gate_failed SMALLINT NOT NULL DEFAULT 0,               -- 확정 미충족 게이트 축 수 (>0 ↔ 불가)
+  need_review SMALLINT NOT NULL DEFAULT 0,               -- 확인필요 축 수 (게이트+보완)
+  axes JSONB NOT NULL,                            -- [{axis, class(gate|supp|info), status(충족|미충족|확인필요), detail}]
   normalizer_version VARCHAR(10),
   computed_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'Asia/Seoul'),
   PRIMARY KEY (company_id, bid_ntce_no, bid_ntce_ord),
@@ -127,4 +130,8 @@ CREATE TABLE IF NOT EXISTS match_results (
 );
 CREATE INDEX IF NOT EXISTS idx_mr_bid ON match_results (bid_ntce_no, bid_ntce_ord);
 CREATE INDEX IF NOT EXISTS idx_mr_company ON match_results (company_id, verdict);
--- 화면: SELECT satisfied, required, axes FROM match_results WHERE company_id=? AND bid_id=?
+-- 기배포된 v2.4(추천/부분충족/미달, gate_failed 없음) 테이블 → v2.5 마이그레이션 (멱등, 신규 배포 시 no-op):
+ALTER TABLE match_results ADD COLUMN IF NOT EXISTS gate_failed SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE match_results DROP CONSTRAINT IF EXISTS match_results_verdict_check;
+ALTER TABLE match_results ADD  CONSTRAINT match_results_verdict_check CHECK (verdict IN ('가능','불가','보완가능','확인필요'));
+-- 화면: SELECT satisfied, required, gate_failed, axes FROM match_results WHERE company_id=? AND bid_id=?
