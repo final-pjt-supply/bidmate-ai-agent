@@ -24,11 +24,16 @@ CREATE TABLE IF NOT EXISTS region_master (
 );
 
 -- 기술인력 자격/등급 마스터 (개인이 갖는 자격 — 인원수 비교용)
+--   M1: qual_type 차원 + grade_rank 추가 — 역할·학위·숙련등급 티어와 '이상' 등급비교 지원.
+--   티어 데이터는 DML/seed_personnel_grade_master_m1_tiers.sql 에서 적재.
 CREATE TABLE IF NOT EXISTS personnel_grade_master (
-  qual_code      VARCHAR(20) PRIMARY KEY,   -- 행정표준코드 '국가자격면허' 코드
+  qual_code      VARCHAR(20) PRIMARY KEY,   -- 행정표준코드 '국가자격면허' 코드 / 자체 티어코드(ROLE_·DEGREE_·SKGRADE_ 등)
   qual_name      VARCHAR(100) NOT NULL,
   grade          VARCHAR(20),               -- 기술사/기능장/산업기사/기사/기능사/역량등급
-  field          VARCHAR(50)                -- 자격명 어간 (분야)
+  field          VARCHAR(50),               -- 자격명 어간 (분야) = 등급 비교의 family
+  qual_type      VARCHAR(12) NOT NULL DEFAULT 'license'   -- license/role/grade/degree (M1)
+                 CHECK (qual_type IN ('license','role','grade','degree')),
+  grade_rank     SMALLINT                   -- 동일 field 내 등급 순서(초급1<중급2<고급3<특급4). '이상' 매칭 레버. NULL=순서무의미
 );
 
 -- 물품코드 마스터
@@ -40,6 +45,18 @@ CREATE TABLE IF NOT EXISTS item_code_master (
   is_sme_product BOOLEAN DEFAULT FALSE      -- 중기간 경쟁제품 (별도 갱신)
 );
 
+-- 인증 마스터 (회사가 갖는 인증 — 유효기간 비교용)
+CREATE TABLE IF NOT EXISTS cert_master (
+  cert_code   VARCHAR(30) PRIMARY KEY,       -- 공식 코드 부재 → 자체 시맨틱 코드
+  cert_name   VARCHAR(100) NOT NULL,
+  category    VARCHAR(30)  NOT NULL,
+  issuer      VARCHAR(100),
+  law_basis   VARCHAR(150),
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE INDEX IF NOT EXISTS idx_cert_category ON cert_master (category);
+
+
 -- 통합 별칭 테이블 (표기 변형 → 표준 코드 번역 사전, 3개 도메인 공용)
 CREATE TABLE IF NOT EXISTS master_alias (
   entity_type    VARCHAR(20) NOT NULL,      -- 'license' / 'region' / 'personnel'
@@ -48,3 +65,5 @@ CREATE TABLE IF NOT EXISTS master_alias (
   source         VARCHAR(20) DEFAULT 'manual',  -- manual / llm / rule
   PRIMARY KEY (entity_type, alias_text)
 );
+
+

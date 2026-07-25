@@ -1,0 +1,6 @@
+# psycopg v3 — 바이너리 빌드(psycopg_binary) 포함본. Lambda(Amazon Linux) manylinux 휠 사용.
+# ⚠ 반드시 `sam build --use-container`로 빌드해 Lambda 런타임과 동일 플랫폼 휠을 받을 것.
+psycopg[binary]==3.2.*
+
+# boto3는 Lambda 런타임에 기본 포함이라 번들 불필요(명시하지 않음).
+# normalizer.py / normalize_output_adapter.py 는 소스 파일로 이 디렉터리에 함께 둔다(패키지 아님).
