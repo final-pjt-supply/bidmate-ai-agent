@@ -64,15 +64,27 @@ def render_answer(out: RespondOutput) -> str:
     return "\n".join(line for line in lines if line)
 
 
+# verdict(게이트 3-state) → 표시 라벨. verdict가 없으면(stub 등) passed로 폴백.
+_VERDICT_LABEL = {
+    "가능": "자격 통과",
+    "불가": "자격 미달",
+    "보완가능": "보완하면 가능",
+    "확인필요": "확인 필요",
+}
+
+
 def _eligibility_block(state) -> str:
     lines = []
     for r in state["eligibility"]:
-        if r.passed:
-            lines.append(f"- {r.bid_id}: 자격 통과")
-        else:
-            reasons = "; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
-                                for f in r.failed_reasons)
-            lines.append(f"- {r.bid_id}: 자격 미달 ({reasons})")
+        label = _VERDICT_LABEL.get(r.verdict) if r.verdict else None
+        if label is None:                       # verdict 없음(stub) → 기존 2분법
+            label = "자격 통과" if r.passed else "자격 미달"
+        reasons = "; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
+                            for f in r.failed_reasons)
+        line = f"- {r.bid_id}: {label}"
+        if reasons:
+            line += f" ({reasons})"
+        lines.append(line)
     return "\n".join(lines) or "(자격 판정 없음)"
 
 

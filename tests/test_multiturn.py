@@ -1,5 +1,6 @@
 import pytest
 
+import agents.nodes.eligibility as eligibility_mod
 import agents.nodes.retrieval as retrieval_mod
 import agents.nodes.router as router_mod
 from agents.llm import ModelTier
@@ -20,6 +21,17 @@ def _stub_retrieval(monkeypatch):
     monkeypatch.setattr(
         retrieval_mod, "retrieve_chunks",
         lambda query, filters=None, **kw: stubs.retrieval_node({})["chunks"])
+
+
+@pytest.fixture(autouse=True)
+def _stub_eligibility(monkeypatch):
+    """run.py가 B 실구현(eligibility_node)도 배선하므로, 위 검색과 같은
+    이유로 판정 도구만 대체한다. 도구는 DB 함수(compute_match_results)를
+    호출하니 스텁이 없으면 E2E가 실 PG에 붙는다."""
+    monkeypatch.setattr(
+        eligibility_mod, "evaluate_eligibility",
+        lambda company_id, bid_ids=None, **kw:
+            stubs.eligibility_node({})["eligibility"])
 
 
 def _intent(**kw) -> QueryIntent:
