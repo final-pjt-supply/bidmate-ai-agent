@@ -8,10 +8,16 @@
 --     · on-read (실시간)  : SELECT * FROM compute_match_results(9001);
 --     · precompute(캐시)  : INSERT INTO match_results (...) SELECT * FROM compute_match_results(9001);
 --
--- 라이브 필터:
---   bid_table.bid_clse_dt >= now(KST). 인덱스 idx_bid_table_clse 사용 → 라이브 수백~수천건만 계산.
---   ⚠ bid_clse_dt IS NULL(수의계약 등 마감 공란)은 **제외**됨. 포함하려면 아래 live_bids의
---     WHERE에 `OR bt.bid_clse_dt IS NULL` 추가.
+-- 라이브 필터  [2026-07-25 개정 — 에이전트 검색(C)과 기준 통일]:
+--   bid_clse_dt IS NULL OR bid_clse_dt > now(KST). 인덱스 idx_bid_table_clse 사용.
+--   마감일시 공란(수의계약 등)은 '판단 불가'라 살아있는 것으로 본다.
+--     └ 개정 전에는 제외했으나, 검색(C)은 포함하고 있어 해당 공고가 화면에는 뜨는데
+--       자격 판정만 통째로 빠지는 누락이 있었다(실측 43/19,076건).
+--
+--   ★ 라이브 정의는 두 곳에 있다. 한쪽만 고치면 위 누락이 재발한다:
+--       ① 여기 live_bids
+--       ② agents/tools/bid_info.py 의 _OPEN_CONDITION
+--     반드시 같은 식으로 함께 유지할 것.
 --
 -- 축 분류·판정 규칙은 02_match_engine_v1.sql과 100% 동일(정본). 여기선 params → 함수 인자,
 --   대상 공고 → live_bids로 바뀐 것만 다름.
@@ -39,8 +45,9 @@ live_bids AS (
   SELECT s.*
   FROM bid_require_summary s
   JOIN bid_table bt USING (bid_ntce_no, bid_ntce_ord)
-  WHERE bt.bid_clse_dt >= (now() AT TIME ZONE 'Asia/Seoul')
-  --  OR bt.bid_clse_dt IS NULL      -- 마감 공란(수의 등) 포함하려면 주석 해제
+  -- ↓ bid_info._OPEN_CONDITION 과 동일한 식 (동시 유지 대상 — 상단 주석 참조)
+  WHERE (bt.bid_clse_dt IS NULL
+      OR bt.bid_clse_dt > (now() AT TIME ZONE 'Asia/Seoul'))
 ),
 
 -- ═══════════════ ① 면허 (gate) ═══════════════
