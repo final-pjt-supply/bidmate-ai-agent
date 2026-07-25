@@ -1,11 +1,25 @@
+import pytest
+
+import agents.nodes.retrieval as retrieval_mod
 import agents.nodes.router as router_mod
 from agents.llm import ModelTier
 from agents.merge import resolve_filters
+from agents.nodes import stubs
 from agents.run import run_agent
 from agents.schemas import (
     AgentRequest, EntryContext, Filters, PendingClarify, QueryIntent,
     Region, SessionContext,
 )
+
+
+@pytest.fixture(autouse=True)
+def _stub_retrieval(monkeypatch):
+    """run.py가 C 실구현(retrieval_node)을 배선하므로, E2E가 실제
+    OpenSearch·PG·Cloudflare에 붙지 않도록 검색 도구만 스텁 데이터로 대체한다.
+    (LLM을 monkeypatch하는 것과 같은 원칙 — 외부 의존만 끊고 배선은 실물)"""
+    monkeypatch.setattr(
+        retrieval_mod, "retrieve_chunks",
+        lambda query, filters=None, **kw: stubs.retrieval_node({})["chunks"])
 
 
 def _intent(**kw) -> QueryIntent:
