@@ -1,0 +1,7 @@
+# 빌드 산출물 / 벤더링된 의존성 — 재현: `sam build --use-container` 또는 `docker build`
+build/
+*.zip
+
+# src/ 에 빌드 직전 복사해 넣는 팀 원본 (정본: "../master table/Dictionary/py/") — 커밋 안 함
+src/normalizer.py
+src/normalize_output_adapter.py
