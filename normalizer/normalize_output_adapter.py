@@ -36,7 +36,11 @@ from typing import Any
 
 log = logging.getLogger("normalize_adapter")
 
-NORMALIZER_VERSION = "v1.7"   # summary.normalizer_version — 재정규화 레버
+NORMALIZER_VERSION = "v1.8"   # summary.normalizer_version — 재정규화 레버
+#   v1.8 (2026-07-27): normalizer 면허 규칙 보강 + 아래 두 가지.
+#     · 인증칸에서 신용평가등급 확인서 분리 (신용 축 소관, 실측 72건)
+#     · 물품칸→면허 교차이동분의 or_group 을 단일 'x' 로 통합
+#   ※ 이 상수를 올리면 select_targets 가 전건을 재정규화 대상으로 잡는다.
 
 # ─────────────────────────────────────────────────────────────
 # 상수 (어댑터 소관 규칙)
@@ -51,6 +55,10 @@ CERT_ROUTE_SIZE   = ("중소기업확인", "중소기업제품", "소기업확�
 #   기술개발제품)' 같은 실인증은 '소상공인'이 없어 안전(바 '중소기업'은 과제외라 미채택).
 CERT_IGNORE       = ("여성기업", "장애인기업", "사회적기업",      # 우대(가점) — v1 제외
                      "공장등록", "사업자등록", "납세증명", "국세완납", "지방세완납")
+# v1.8: 인증칸에 섞인 신용 서류 → 신용 축 소관이라 인증에서 뺀다.
+#   실측 '신용평가등급 확인서' 42 + '신용평가등급확인서' 30 = 72건이 cert 미해석으로 쌓여 있었다.
+#   (신용 요구 자체는 bid_table.credit_rating_req → bid_require_credit 로 별도 적재됨)
+CERT_ROUTE_CREDIT = ("신용평가등급", "신용등급")
 
 # 실적 basis에서 집계 방식 판정
 _AGG_SUM   = ("누계", "합산", "합계", "총")
@@ -172,6 +180,7 @@ def route_cert(name_raw: str, norm: Any, mn: MasterNames) -> dict | None:
     s = str(name_raw)
     if any(k in s for k in CERT_ROUTE_DIRECT):  return None  # 직생 → 품목 축(이미 처리)
     if any(k in s for k in CERT_ROUTE_SIZE):    return None  # 규모 → 규모 축
+    if any(k in s for k in CERT_ROUTE_CREDIT):  return None  # v1.8: 신용 → 신용 축
     if any(k in s for k in CERT_IGNORE):        return None  # 우대·일반서류 → 무시
     code = mn.cert_alias.get(norm.canon_key(s))
     return {
@@ -293,7 +302,12 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
         })
 
     # ── ④ 품목 + 직생 흡수 (route:license면 물품칸의 업종 → 면허 축으로 교차 이동) ──
-    _lic_xr = 0
+    #   v1.8: 교차이동분은 or_group 을 단일 'x' 로 묶는다.
+    #     종전에는 x1, x2, x3… 로 흩어져 매칭에서 각각 독립 AND 그룹으로 세어졌고,
+    #     그 결과 "이 품목을 하려면 이 면허 중 하나" 라는 유추가 "전부 보유" 요구로 바뀌었다.
+    #     (실측: live 31건이 과조임. R26BK01426807 은 9개 AND 그룹이 되어 폐기물 4종을 모두 요구)
+    #     품목 경유는 유추이므로 OR 가 맞다. compute_match_results 도 같은 판단으로 병합 중이며,
+    #     여기서 고치면 SQL 쪽 보정은 방어용으로만 남는다.
     for req in (bid.get("item_codes") or []):
         if isinstance(req, dict):
             raw = req.get("code") or req.get("name") or ""; type_hint = req.get("type")
@@ -301,11 +315,10 @@ def build_rows(bid: dict, norm: Any, mn: MasterNames, ctx: Any) -> dict[str, lis
             raw = req; type_hint = None
         res = norm.normalize_item_code(str(raw), ctx, type_hint)
         if res.method == "route:license":    # 물품칸에 기재된 업종 → 면허 축으로 교차 이동
-            _lic_xr += 1
             for code in (res.codes or [None]):
                 lc = _fk(code, mn.license)
                 out["licenses"].append({
-                    "bid_ntce_no": no, "bid_ntce_ord": ord_, "or_group": f"x{_lic_xr}",
+                    "bid_ntce_no": no, "bid_ntce_ord": ord_, "or_group": "x",
                     "license_code": lc, "license_name": mn.license.get(lc) if lc else None,
                     "method": res.method, "source": "item_field",
                     "qualifier": None, "name_raw": str(raw),

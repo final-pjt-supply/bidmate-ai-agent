@@ -2,8 +2,21 @@
 
 순수 함수 모듈: DB 접속 없음. 조회 자료(별칭·마스터)는 LookupContext로 주입한다.
 규칙 순서와 근거: 2026-07-21 커버리지 검수 실측 (작업일지 참조)
-  ⓪ 내장 코드 추출(+42.7%p 실증) → ① 구두점·공백 통일 → ② 접미사 제거
-  → ③ OR 분해 → ④ 무시 목록 → ⑤ 특수/라우팅
+  ⓪ 내장 코드 추출(+42.7%p 실증) → ① 구두점·공백 통일 → ①-b 법령 전치사 제거
+  → ② 접미사 제거 → ③ OR 분해 → ④ 무시 목록 → ⑤ 특수/라우팅
+
+v1.8 (2026-07-27) — 면허 미해석 실측 분석 후 보강.
+  실측: 미해석 2,203행 / live 요구공고 849건 중 232건(27.3%)에 미해석 포함.
+        verdict '확인필요' 163건의 사실상 단독 원인.
+  · ⓪ search → finditer : "[A(9902)] 또는 [B(3230)] 또는 [C(3244)]" 에서 첫 코드만 잡고
+    끝나던 문제. OR 연결이면 전부 수집한다. AND('과/와')는 Result(codes=OR)가 표현할 수
+    없으므로 첫 코드만 쓰되 유실분을 qualifier 에 남긴다(추적용).
+  · ②  "~로 신고한 자" 미지원 → 정보통신 엔지니어링/기술사 계열 62건이 여기서 막혔다.
+  · ①-b 법령 전치사 신설 : "전력기술관리법 제2조제3호에 따른 X", "건설산업기본법에 따른 X".
+  · ④  인증·증서류 무시 목록 확대 — 면허칸에 섞인 안전인증·적합성평가·보험증서 등.
+  ※ 표현 변형(전력시설물 설계 4종 41건, 소방설계 3종 34건, 정보통신 8종 62건 등)은
+    규칙이 아니라 master_alias 등록으로 해결한다. canon_key 가 공백·구두점을 흡수하므로
+    대표형 1건 등록이면 띄어쓰기 변형은 자동으로 함께 잡힌다.
 
 배치 러너 사용법:
     ctx = LookupContext(alias=..., license_codes=..., item_codes=..., item_names=...)
@@ -63,9 +76,16 @@ def _clean(text: str) -> str:
 
 def canon_key(text: str) -> str:
     """v1.5: 별칭 조회용 정규화 키 — 구두점 통일 + 쉼표→· + 따옴표 제거 + 공백 전부 제거.
-    별칭 키(공식명)와 조회 텍스트 양쪽에 동일 적용해야 한다."""
+    별칭 키(공식명)와 조회 텍스트 양쪽에 동일 적용해야 한다.
+
+    v1.8: 가운뎃점(·)과 마침표(.)도 제거한다. 통일만으로는 '개수' 차이를 못 넘었다.
+      실측  원문 '금속·창호·지붕·건축물조립공사업'  ↔ 마스터 '금속창호ㆍ지붕건축물조립공사업'(4991)
+            원문 '상하수도설비공사업'                ↔ 마스터 '상ㆍ하수도설비공사업'(4996)
+            원문 '학술연구용역'                      ↔ 마스터 '학술.연구용역'(1169)
+      구분자 유무만으로 갈리는 서로 다른 업종은 마스터에 없으므로 안전하다."""
     t = _clean(str(text))
     t = t.replace(",", "·").replace("‘", "").replace("’", "").replace("'", "")
+    t = t.replace("·", "").replace(".", "")
     return re.sub(r"\s+", "", t)
 
 
@@ -73,7 +93,12 @@ def canon_key(text: str) -> str:
 # 면허 (license)
 # ────────────────────────────────────────────────
 # 규칙 ⓪: 괄호 내 4자리 업종코드 — "(1468)", "(업종코드: 1169)", "(6202, 주력분야…)" (v1.3: 쉼표 종결 허용)
-_LIC_CODE_RE = re.compile(r"(?<![0-9])(\d{4})\s*[,)]")
+# v1.8: 종결자 확대 — "[업종코드 4990]", "기타자유업(행사대행업) 9901" 형식을 놓치고 있었다.
+#   (산업디자인전문회사 4종 [4440][4442][4443][4444] 가 하나도 안 잡히던 원인)
+_LIC_CODE_RE = re.compile(r"(?<![0-9])(\d{4})\s*(?:[,)\]]|$)")
+# v1.8: 다중 코드의 연결어 판별. '또는'=OR(codes 에 전부), '과/와'=AND(Result 가 표현 불가).
+_LIC_OR_CONN  = re.compile(r"또는|혹은|이거나")
+_LIC_AND_CONN = re.compile(r"[가-힣)\]]\s*(?:과|와)\s+[가-힣\[(]")
 # v1.3: 단독 10자리 세부품명번호 내장 ("전기히트펌프(4010180601)") → item 라우팅
 _LIC_ITEM10_RE = re.compile(r"(?<![0-9])(\d{10})(?![0-9])")
 # 규칙 ②: 접미사 (긴 패턴 먼저)
@@ -84,10 +109,22 @@ _LIC_SUFFIXES = [
     re.compile(r"[을를]?\s*등록\s*(?:한\s*자|한\s*업체)?$"),          # v1.4: "~을 등록" 포함
     re.compile(r"(?:으로|로)\s*등록(?:한\s*자)?$"),                   # v1.4: "~으로 등록한 자"
     re.compile(r"(?:으로|로)\s*신고(?:를?\s*필한\s*자)?$"),           # v1.3: "~로 신고"
+    re.compile(r"(?:으로|로)\s*신고한\s*자$"),                        # v1.8: "~로 신고한 자" (실측 62건)
+    re.compile(r"에게\s*신고를?\s*필한\s*자$"),                       # v1.8: "국토교통부장관에게 신고를 필한 자"
+    re.compile(r"(?<=[업사소자인)\]])(?:으로|로)$"),                    # v1.8: "…설계업으로", "…(1종)으로" 잔재
+    re.compile(r"\s*면허증$"),                                       # v1.8: "정보통신공사업 면허증"
+    re.compile(r"\s*허가$"),                                         # v1.8: "…제조·판매업 허가"
     re.compile(r"[을를]?\s*개설\s*및\s*신고를?\s*필한\s*자$"),         # v1.4: 건축사사무소 개설·신고
     re.compile(r"\s*업종$"),
     re.compile(r"\s*면허$"),
 ]
+# v1.8 규칙 ①-b: 법령 전치사 제거 — "전력기술관리법 제2조제3호에 따른 X", "건설산업기본법에 따른 X"
+#   근거법령이 앞에 붙어 별칭 조회가 통째로 실패하던 케이스.
+_LIC_LAW_PREFIX = re.compile(
+    r"^[「『\[]?[가-힣]{2,}법(?:령)?[」』\]]?"
+    r"(?:\s*제\d+조(?:\s*제\d+항)?(?:\s*제\d+호)?)?"
+    r"\s*에\s*(?:따른|의한|의하여)\s*")
+
 # v1.4: 총칭 표기 → 공식 세부 업종들의 OR (identity 별칭 경유로 코드 해석 — 코드 하드코딩 금지)
 _LIC_UMBRELLA = {
     "소프트웨어사업자": [
@@ -100,7 +137,10 @@ _LIC_UMBRELLA = {
 # 규칙 ④: 무시 목록 (면허가 아닌 것) — v1.2: 등록증·허가증·조합 등재 추가 (7/22 표본 검수)
 _LIC_IGNORE = re.compile(
     r"확인서|증명서|고유번호|품질인증|입찰참가자격등록을 한 자|공급인증|성적서"
-    r"|등록증$|허가증$|조합공동사업|기업리스트|등재")
+    r"|등록증$|허가증$|조합공동사업|기업리스트|등재"
+    # v1.8: 면허칸에 섞인 인증·증서류 (실측 — 안전인증 10, 적합성평가 7, 전자파 적합 인증서 7 …)
+    r"|안전인증|적합성평가|적합\s*인증|형식승인|인증서$"
+    r"|보험증서|공제증서|수료증|검사확인증|합격증|서약서|확약서")
 # v1.2: 면허 필드에 혼입된 물품 참가자격 → item 도메인 라우팅
 _LIC_ITEM_REG = re.compile(r"물품으로\s*(?:의\s*)?입찰참가|제조(?:\s*또는\s*공급)?\s*물품")
 _LIC_ITEM_CODE = re.compile(r"(\d{10}|\d{8})")
@@ -154,6 +194,16 @@ def _split_or(text: str) -> list[str]:
     if m:
         head, a, b = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
         return [f"{head}({a})", f"{head}({b})"]
+    # v1.8: 괄호 안 "A 및 B" — 마스터가 분야별로 분리 보유하는 경우.
+    #   실측  '일반소방시설설계업(기계 및 전기)' ↔ 마스터 1490 (기계) / (전기) 별도
+    #         '일반소방공사감리업(기계 및 전기)' ↔ 마스터 1493 (기계)
+    #   의미상 AND(동시보유)지만 Result(codes=OR)로는 표현할 수 없어 관대한 쪽으로 둔다.
+    #   ※ '및' 양쪽 공백을 요구한다 — '데이터베이스제작및검색서비스사업'처럼 붙어 있는
+    #     업종명을 쪼개지 않기 위해서.
+    m = re.match(r"^(.+?)\(\s*([^()]+?)\s+및\s+([^()]+?)\s*\)$", text)
+    if m:
+        head, a, b = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        return [f"{head}({a})", f"{head}({b})"]
     # 괄호 깊이 0에서의 " 또는 " 분리
     parts, depth, buf = [], 0, ""
     i = 0
@@ -179,11 +229,34 @@ def normalize_license(raw: str, ctx: LookupContext) -> Result:
     if not raw or not raw.strip():
         return r
     text = _clean(raw).strip("[]")           # v1.3: 대괄호 래핑 제거
+    # ①-b (v1.8) 법령 전치사 제거 — 반복 적용 (중첩 인용 대응)
+    while True:
+        t2 = _LIC_LAW_PREFIX.sub("", text).strip()
+        if t2 == text:
+            break
+        text = t2
 
-    # ⓪ 내장 업종코드
-    m = _LIC_CODE_RE.search(text)
-    if m and m.group(1) in ctx.license_codes:
-        r.codes, r.method = [m.group(1)], "rule0"
+    # ⓪ 내장 업종코드 (v1.8: search → finditer, 다중 코드 수집)
+    found = [m.group(1) for m in _LIC_CODE_RE.finditer(text)]
+    found = [c for c in dict.fromkeys(found) if c in ctx.license_codes]   # 순서 보존 dedup
+    if found:
+        if len(found) == 1:
+            r.codes, r.method = found, "rule0"
+            return r
+        if _LIC_OR_CONN.search(text):
+            r.codes, r.method = found, "rule0"        # OR: 하나라도 보유 시 충족
+            return r
+        if _LIC_AND_CONN.search(text):
+            # AND 조합. Result(codes=OR)로는 표현할 수 없다.
+            #   느슨한 쪽(첫 코드만)을 택하고 유실분을 qualifier 에 남긴다.
+            #   ※ 정확히 표현하려면 or_group 을 나눠야 하는데, 그러면 이 공고의 항목들이
+            #     실제로는 '대안 조합'인 경우(실측 R26BK01426807: 건물관리+폐기물A / +B / +C / +D)
+            #     오히려 더 조여진다. 항목 간 OR 판별은 추출 스키마 몫이라
+            #     여기서는 관대한 쪽을 유지한다.
+            r.codes, r.method = [found[0]], "rule0"
+            r.qualifier = "AND조합 미반영: " + "+".join(found[1:])
+            return r
+        r.codes, r.method = found, "rule0"            # 연결어 불명 → OR 로 관대 처리
         return r
 
     # ⓪-b (v1.2) 물품 참가자격 혼입 → item 도메인 라우팅
@@ -264,6 +337,15 @@ def normalize_license(raw: str, ctx: LookupContext) -> Result:
         return None
 
     candidates = _split_or(base)
+    # v1.8: 총칭 조각("면허"·"등록"·"공사업")은 OR 대안이 아니라 표현 잔재다.
+    #   "전기공사업 등록 또는 면허" → ["전기공사업 등록", "면허"] 로 쪼개지면서
+    #   len(codes) >= len(candidates) 조건을 못 넘겨 통째로 미해석이 되던 문제.
+    def _is_filler(c: str) -> bool:
+        x = _strip_suffixes(_clean(c))
+        return (not x.strip()) or x in _LIC_GENERIC
+    _real = [c for c in candidates if not _is_filler(c)]
+    if _real and len(_real) < len(candidates):
+        candidates = _real
     codes, comps = [], []
     for c in candidates:
         comps.append(_strip_suffixes(_clean(c)))
