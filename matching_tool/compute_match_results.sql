@@ -21,24 +21,42 @@
 --
 -- 축 분류·판정 규칙은 02_match_engine_v1.sql과 100% 동일(정본). 여기선 params → 함수 인자,
 --   대상 공고 → live_bids로 바뀐 것만 다름.
+--
+-- ── 변경 이력 ──────────────────────────────────────────────
+-- 2026-07-27  [D3] axes 페이로드에 required·actual 분리 적재.
+--   10개 ax_* CTE 가 req_value·act_value 를 만들고 per_bid 가 JSON 키로 싣는다.
+--   detail 은 유지(하위호환·요약용). 컬럼명을 req_value/act_value 로 둔 이유는
+--   per_bid 의 출력 별칭 required 및 ax_credit 의 c.required(boolean)와 겹치기 때문.
+--   ★ axis_all 이 SELECT * UNION ALL 이라 축을 추가하면 두 컬럼을 반드시 채워야 한다
+--     (안 채우면 함수 생성 실패 — 이게 D3 재발 방지 장치다).
+--   소비자: agents/tools/eligibility.py::_to_result (키 없으면 detail 로 폴백).
+--
+-- 2026-07-27  [신용 가드] credit 축 위양성 차단.
+--   "신용정보 관리규약에 의한 채무불이행 또는 금융질서 문란자"는 입찰보증금 납부조건
+--   또는 부정당업자 결격사유지 신용등급 요구가 아니다. 실측 3,611건 중 933건(25.8%).
+--   credit_ev/credit_fp 가 extraction_evidence 근거로 판별해 '충족' 처리한다.
+--   축을 지우지 않는 이유는 required 분모를 흔들지 않기 위해서. 원복은 CASE 첫 줄 삭제.
+--   ※ 대증요법이다. 근본 수정은 추출 프롬프트(결격사유를 credit_rating_req 로 잡지 않기).
+--
+-- 2026-07-27  [TZ] CURRENT_DATE → params.today_kst 통일.
+--   CURRENT_DATE 는 세션 TimeZone 의 날짜라, 세션이 UTC 면 KST 00:00~09:00 구간에서
+--   하루 전이 나온다. live 조건은 AT TIME ZONE 으로 세션 무관인데 직생·실적·인증
+--   3축만 CURRENT_DATE 를 써서 규약이 갈려 있었다(같은 데이터인데 세션따라 판정이 달라짐).
+--   → 이제 함수 전체가 세션 tz 무관. pg_timezone 고정에 의존하지 않는다.
 -- ============================================================================
 
-CREATE OR REPLACE FUNCTION compute_match_results(p_company_id BIGINT)
-RETURNS TABLE (
-  company_id         BIGINT,
-  bid_ntce_no        VARCHAR(40),
-  bid_ntce_ord       VARCHAR(10),
-  verdict            TEXT,
-  required           INT,
-  satisfied          INT,
-  gate_failed        INT,
-  need_review        INT,
-  axes               JSONB,
-  normalizer_version VARCHAR(10)
-)
-LANGUAGE sql STABLE AS $$
+CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
+ RETURNS TABLE(company_id bigint, bid_ntce_no character varying, bid_ntce_ord character varying, verdict text, required integer, satisfied integer, gate_failed integer, need_review integer, axes jsonb, normalizer_version character varying)
+ LANGUAGE sql
+ STABLE
+AS $function$
 WITH params AS (
-  SELECT p_company_id AS company_id
+  SELECT p_company_id AS company_id,
+         -- [TZ] 기준일. CURRENT_DATE 는 세션 TimeZone 의 날짜라 세션이 UTC 면 KST 00:00~09:00
+         --      구간에서 하루 전이 나온다. live 조건(18행)은 AT TIME ZONE 으로 세션 무관인데
+         --      직생·실적·인증 3축만 CURRENT_DATE 를 써서 규약이 갈려 있었다.
+         --      → 같은 데이터·같은 회사인데 세션 tz 에 따라 판정이 달라진다. 여기서 통일한다.
+         (now() AT TIME ZONE 'Asia/Seoul')::date AS today_kst
 ),
 -- 라이브 공고 = 투찰마감 미도래. summary 전체 컬럼 보존(region_limit_type·normalizer_version 등).
 live_bids AS (
@@ -66,7 +84,9 @@ ax_license AS (
          CASE WHEN BOOL_AND(grp_match)                           THEN '충족'
               WHEN BOOL_OR(NOT grp_match AND NOT grp_unresolved) THEN '미충족'
               ELSE '확인필요' END AS status,
-         COUNT(*) FILTER (WHERE grp_match) || '/' || COUNT(*) || ' 그룹 충족' AS detail
+         COUNT(*) FILTER (WHERE grp_match) || '/' || COUNT(*) || ' 그룹 충족' AS detail,
+         COUNT(*) || '개 면허그룹'                                  AS req_value,
+         COUNT(*) FILTER (WHERE grp_match) || '개 보유'             AS act_value
   FROM lic_group GROUP BY 1,2
 ),
 
@@ -82,7 +102,10 @@ reg_rows AS (
              SELECT 1 FROM hq
              WHERE hq.region_code = r.region_code
                 OR hq.region_code LIKE r.region_code || '%')) AS hq_match,
-         BOOL_OR(r.region_code IS NULL OR r.flag = 'site_ref') AS any_unresolved
+         BOOL_OR(r.region_code IS NULL OR r.flag = 'site_ref') AS any_unresolved,
+         -- D3: 요구 지역 코드 목록 (이름 컬럼이 있으면 region_code 를 그것으로 교체 가능)
+         STRING_AGG(DISTINCT r.region_code, ', ')
+           FILTER (WHERE r.region_code IS NOT NULL)             AS req_regions
   FROM bid_require_regions r
   JOIN live_bids lb ON lb.bid_ntce_no = r.bid_ntce_no AND lb.bid_ntce_ord = r.bid_ntce_ord
   GROUP BY 1,2
@@ -95,7 +118,11 @@ ax_region AS (
               ELSE '미충족' END AS status,
          CASE WHEN rr.any_nationwide THEN '전국 (제한없음)'
               WHEN rr.hq_match       THEN '본점 소재지 충족'
-              ELSE '요구 지역 불일치/미해석' END AS detail
+              ELSE '요구 지역 불일치/미해석' END AS detail,
+         CASE WHEN rr.any_nationwide THEN '전국 (제한없음)'
+              ELSE COALESCE(rr.req_regions, '(미해석)') END      AS req_value,
+         COALESCE((SELECT STRING_AGG(region_code, ', ') FROM hq),
+                  '(본점 미등록)')                                AS act_value
   FROM live_bids s
   JOIN reg_rows rr USING (bid_ntce_no, bid_ntce_ord)
   WHERE s.region_limit_type = 'hq_location'
@@ -113,7 +140,12 @@ ax_size AS (
               WHEN z.size_limit IN ('no_large','no_conglomerate')
                    AND cq.company_size <> 'conglomerate' THEN '충족'
               ELSE '미충족' END AS status,
-         z.size_limit || ' vs ' || COALESCE(cq.company_size,'(미등록)') AS detail
+         z.size_limit || ' vs ' || COALESCE(cq.company_size,'(미등록)') AS detail,
+         -- size_limit 가 NULL 이면 detail 도 NULL 이 된다(|| 전파). 기존 동작이라 detail 은 그대로 두고,
+         -- req_value 만 COALESCE 한다. 파이썬 폴백이 `or` 라 NULL·빈문자면 detail 로 떨어지는데
+         -- 그 detail 마저 NULL 이라 status('미충족')까지 흘러가 D3 가 그대로 재현되기 때문.
+         COALESCE(z.size_limit, '(미해석)')                    AS req_value,
+         COALESCE(cq.company_size, '(미등록)')                 AS act_value
   FROM bid_require_size z
   JOIN live_bids lb ON lb.bid_ntce_no = z.bid_ntce_no AND lb.bid_ntce_ord = z.bid_ntce_ord
   LEFT JOIN comp_qual cq ON TRUE
@@ -126,7 +158,7 @@ dp_rows AS (
          COUNT(*) FILTER (WHERE i.item_code IS NULL) AS n_unres,
          COUNT(*) FILTER (WHERE ci.item_code IS NOT NULL AND ci.has_direct_production
                             AND (ci.direct_prod_valid_until IS NULL
-                                 OR ci.direct_prod_valid_until >= CURRENT_DATE)) AS n_ok
+                                 OR ci.direct_prod_valid_until >= p.today_kst)) AS n_ok
   FROM bid_require_items i
   JOIN live_bids lb ON lb.bid_ntce_no = i.bid_ntce_no AND lb.bid_ntce_ord = i.bid_ntce_ord
   CROSS JOIN params p
@@ -139,7 +171,9 @@ ax_direct_prod AS (
          CASE WHEN n_ok = n_req           THEN '충족'
               WHEN n_ok + n_unres = n_req THEN '확인필요'
               ELSE '미충족' END AS status,
-         '직생확인 ' || n_ok || '/' || n_req AS detail
+         '직생확인 ' || n_ok || '/' || n_req AS detail,
+         n_req || '개 품목 직생확인'          AS req_value,
+         n_ok  || '개 보유'                  AS act_value
   FROM dp_rows
 ),
 
@@ -161,7 +195,9 @@ ax_item AS (
          CASE WHEN n_ok = n_req           THEN '충족'
               WHEN n_ok + n_unres = n_req THEN '확인필요'
               ELSE '미충족' END AS status,
-         '품목 등록 ' || n_ok || '/' || n_req AS detail
+         '품목 등록 ' || n_ok || '/' || n_req AS detail,
+         n_req || '개 품목 등록'              AS req_value,
+         n_ok  || '개 등록'                  AS act_value
   FROM item_rows
 ),
 
@@ -198,7 +234,9 @@ ax_personnel AS (
          CASE WHEN BOOL_AND(met)         THEN '충족'
               WHEN BOOL_OR(met IS FALSE) THEN '미충족'
               ELSE '확인필요' END AS status,
-         '인력 요건 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail
+         '인력 요건 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail,
+         COUNT(*) || '개 인력요건'                        AS req_value,
+         COUNT(*) FILTER (WHERE met) || '개 충족'         AS act_value
   FROM pers_eval GROUP BY 1,2
 ),
 
@@ -210,17 +248,17 @@ perf_rows AS (
            WHEN r.unit = '원' AND COALESCE(r.agg_type,'single') = 'single' THEN
              (SELECT COALESCE(MAX(pr.contract_amt),0) FROM company_performance_records pr, params p
                WHERE pr.company_id = p.company_id
-                 AND pr.end_date >= CURRENT_DATE - (r.period_years * INTERVAL '1 year')
+                 AND pr.end_date >= p.today_kst - (r.period_years * INTERVAL '1 year')
                  AND (r.field_code IS NULL OR pr.field_code = r.field_code)) >= r.min_value
            WHEN r.unit = '원' THEN
              (SELECT COALESCE(SUM(pr.contract_amt),0) FROM company_performance_records pr, params p
                WHERE pr.company_id = p.company_id
-                 AND pr.end_date >= CURRENT_DATE - (r.period_years * INTERVAL '1 year')
+                 AND pr.end_date >= p.today_kst - (r.period_years * INTERVAL '1 year')
                  AND (r.field_code IS NULL OR pr.field_code = r.field_code)) >= r.min_value
            WHEN r.unit = '건' THEN
              (SELECT COUNT(*) FROM company_performance_records pr, params p
                WHERE pr.company_id = p.company_id
-                 AND pr.end_date >= CURRENT_DATE - (r.period_years * INTERVAL '1 year')
+                 AND pr.end_date >= p.today_kst - (r.period_years * INTERVAL '1 year')
                  AND (r.field_code IS NULL OR pr.field_code = r.field_code)) >= r.min_value
          END AS met
   FROM bid_require_performances r
@@ -231,7 +269,9 @@ ax_performance AS (
          CASE WHEN BOOL_AND(met)         THEN '충족'
               WHEN BOOL_OR(met IS FALSE) THEN '미충족'
               ELSE '확인필요' END AS status,
-         '실적 요건 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail
+         '실적 요건 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail,
+         COUNT(*) || '개 실적요건'                        AS req_value,
+         COUNT(*) FILTER (WHERE met) || '개 충족'         AS act_value
   FROM perf_rows GROUP BY 1,2
 ),
 
@@ -255,22 +295,56 @@ ax_capacity AS (
          CASE WHEN BOOL_AND(met)         THEN '충족'
               WHEN BOOL_OR(met IS FALSE) THEN '미충족'
               ELSE '확인필요' END AS status,
-         '시공능력 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail
+         '시공능력 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail,
+         COUNT(*) || '개 시공능력요건'                     AS req_value,
+         COUNT(*) FILTER (WHERE met) || '개 충족'          AS act_value
   FROM cap_rows GROUP BY 1,2
 ),
 
--- ═══════════════ ⑧ 신용 (supp) ═══════════════
+-- ═══════════════ ⑧ 신용 (supp) — 위양성 가드 추가 ═══════════════
+-- credit_rating_req 근거 스니펫만 뽑는다. extraction_evidence 는 두 세대로 shape 가 다르다:
+--   구(백필) = [{page, field, snippet}, ...]        · 신(일일) = {field: [{page, snippet, ...}]}
+credit_ev AS (
+  SELECT lb.bid_ntce_no, lb.bid_ntce_ord, e->>'snippet' AS snip
+  FROM live_bids lb
+  JOIN bid_table bt ON bt.bid_ntce_no = lb.bid_ntce_no AND bt.bid_ntce_ord = lb.bid_ntce_ord,
+       LATERAL jsonb_array_elements(bt.extraction_evidence) AS e
+  WHERE jsonb_typeof(bt.extraction_evidence) = 'array'
+    AND e->>'field' = 'credit_rating_req'
+  UNION ALL
+  SELECT lb.bid_ntce_no, lb.bid_ntce_ord, e->>'snippet'
+  FROM live_bids lb
+  JOIN bid_table bt ON bt.bid_ntce_no = lb.bid_ntce_no AND bt.bid_ntce_ord = lb.bid_ntce_ord,
+       LATERAL jsonb_array_elements(bt.extraction_evidence -> 'credit_rating_req') AS e
+  WHERE jsonb_typeof(bt.extraction_evidence) = 'object'
+    AND jsonb_typeof(bt.extraction_evidence -> 'credit_rating_req') = 'array'
+),
+-- 근거가 전부 결격사유/입찰보증금 조항인 공고 = 신용등급 요구가 아님(위양성)
+credit_fp AS (
+  SELECT bid_ntce_no, bid_ntce_ord
+  FROM credit_ev
+  GROUP BY 1,2
+  HAVING BOOL_AND(snip ~ '(채무불이행|금융질서\s*문란|신용정보\s*관리규약)')
+),
 ax_credit AS (
   SELECT c.bid_ntce_no, c.bid_ntce_ord, 'credit' AS axis, 'supp' AS class,
-         CASE WHEN NOT c.required THEN '충족'
-              WHEN c.min_grade IS NOT NULL THEN '확인필요'
+         CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '충족'   -- ← 가드: 위양성. 지우면 원복.
+              WHEN NOT c.required THEN '충족'
+              WHEN c.min_grade IS NOT NULL THEN '확인필요'   -- v1 도달 불가(min_grade 전건 NULL)
               WHEN cq.credit_rating IS NOT NULL THEN '충족'
               ELSE '미충족' END AS status,
-         CASE WHEN c.min_grade IS NOT NULL THEN '요구등급 ' || c.min_grade || ' (v1 비교불가)'
+         CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '신용등급 요구 아님 (결격사유 오인식 보정)'
+              WHEN c.min_grade IS NOT NULL THEN '요구등급 ' || c.min_grade || ' (v1 비교불가)'
               WHEN cq.credit_rating IS NOT NULL THEN '신용평가 보유(' || cq.credit_rating || ')'
-              ELSE '신용평가 미보유' END AS detail
+              ELSE '신용평가 미보유' END AS detail,
+         CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '(요구 없음)'
+              WHEN NOT c.required          THEN '(요구 없음)'
+              WHEN c.min_grade IS NOT NULL THEN c.min_grade
+              ELSE '신용평가등급 보유' END                    AS req_value,
+         COALESCE(cq.credit_rating, '(미보유)')               AS act_value
   FROM bid_require_credit c
   JOIN live_bids lb ON lb.bid_ntce_no = c.bid_ntce_no AND lb.bid_ntce_ord = c.bid_ntce_ord
+  LEFT JOIN credit_fp fp ON fp.bid_ntce_no = c.bid_ntce_no AND fp.bid_ntce_ord = c.bid_ntce_ord
   LEFT JOIN comp_qual cq ON TRUE
 ),
 
@@ -280,9 +354,10 @@ cert_rows AS (
          COUNT(*) AS n_req,
          COUNT(*) FILTER (WHERE r.cert_code IS NULL) AS n_unres,
          COUNT(*) FILTER (WHERE cc.cert_code IS NOT NULL
-                            AND (cc.valid_until IS NULL OR cc.valid_until >= CURRENT_DATE)) AS n_ok,
+                            AND (cc.valid_until IS NULL OR cc.valid_until >= p.today_kst)) AS n_ok,
          STRING_AGG(DISTINCT r.cert_name, ', ')
-           FILTER (WHERE r.cert_code IS NOT NULL AND cc.cert_code IS NULL) AS missing_names
+           FILTER (WHERE r.cert_code IS NOT NULL AND cc.cert_code IS NULL) AS missing_names,
+         STRING_AGG(DISTINCT r.cert_name, ', ')                            AS all_names
   FROM bid_require_certs r
   JOIN live_bids lb ON lb.bid_ntce_no = r.bid_ntce_no AND lb.bid_ntce_ord = r.bid_ntce_ord
   CROSS JOIN params p
@@ -295,7 +370,10 @@ ax_cert AS (
               WHEN n_ok + n_unres = n_req THEN '확인필요'
               ELSE '미충족' END AS status,
          '인증 ' || n_ok || '/' || n_req
-           || COALESCE(' · 취득하면 가능: ' || missing_names, '') AS detail
+           || COALESCE(' · 취득하면 가능: ' || missing_names, '') AS detail,
+         COALESCE(all_names, n_req || '개 인증')                  AS req_value,
+         n_ok || '개 보유'
+           || COALESCE(' (미보유: ' || missing_names || ')', '')  AS act_value
   FROM cert_rows
 ),
 
@@ -319,7 +397,8 @@ per_bid AS (
          COUNT(*) FILTER (WHERE class = 'gate'           AND status = '미충족')   AS gate_failed,
          COUNT(*) FILTER (WHERE class IN ('gate','supp') AND status = '확인필요') AS need_review,
          JSONB_AGG(JSONB_BUILD_OBJECT(
-             'axis', axis, 'class', class, 'status', status, 'detail', detail)
+             'axis', axis, 'class', class, 'status', status, 'detail', detail,
+             'required', req_value, 'actual', act_value)
            ORDER BY CASE class WHEN 'gate' THEN 1 WHEN 'supp' THEN 2 ELSE 3 END, axis) AS axes
   FROM axis_all GROUP BY 1,2
 )
@@ -338,7 +417,8 @@ SELECT p.company_id,
 FROM live_bids s
 CROSS JOIN params p
 LEFT JOIN per_bid b USING (bid_ntce_no, bid_ntce_ord);
-$$;
+$function$
+;
 
 -- ── 사용 ────────────────────────────────────────────────────
 -- on-read (백엔드가 로그인/새로고침 때 호출):
