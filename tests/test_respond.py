@@ -100,6 +100,40 @@ def test_render_answer_is_deterministic_format():
     assert render_answer(out) == render_answer(out)
 
 
+def test_render_answer_labels_with_bid_name_when_available():
+    """공고명을 알면 라벨로 쓴다 — 사용자에게 공고번호는 읽을 이유가 없다."""
+    out = RespondOutput(headline="결론입니다.",
+                        items=[BidItem(bid_id="R001", text="설명 문장.")],
+                        caveat=None)
+    assert render_answer(out, {"R001": "○○청사  청소용역"}) == (
+        "결론입니다.\n- ○○청사 청소용역: 설명 문장.")   # 이중 공백도 정리
+    # 맵에 없는 공고는 기존대로 bid_id (조회 실패·스텁 환경 폴백)
+    assert render_answer(out, {"R999": "다른 공고"}) == (
+        "결론입니다.\n- R001: 설명 문장.")
+
+
+def test_render_answer_does_not_repeat_same_label():
+    """같은 공고를 여러 문장으로 설명해도 이름을 매 줄 반복하지 않는다."""
+    out = RespondOutput(
+        headline="결론입니다.",
+        items=[BidItem(bid_id="R001", text="첫째 근거."),
+               BidItem(bid_id="R001", text="둘째 근거."),
+               BidItem(bid_id="R002", text="다른 공고 근거.")],
+        caveat=None)
+    assert render_answer(out, {"R001": "가공고", "R002": "나공고"}) == (
+        "결론입니다.\n- 가공고: 첫째 근거.\n  · 둘째 근거.\n- 나공고: 다른 공고 근거.")
+
+
+def test_respond_uses_bid_names_from_state(monkeypatch):
+    monkeypatch.setattr(respond_mod.llm, "invoke", lambda *a, **k: _out(
+        items=[{"bid_id": "R26BK_STUB01", "text": "자격 통과, 여유율 2.5배"}]))
+    state = _state()
+    state["bid_names"] = {"R26BK_STUB01": "전기공사 통합 발주"}
+    out = respond_node(state)
+    assert "- 전기공사 통합 발주: " in out["answer"]
+    assert "R26BK_STUB01" not in out["answer"]      # 번호는 citations로만 나간다
+
+
 def test_sanitize_strips_tags_links_urls():
     dirty = '<script>알림</script> [클릭](https://evil.com) https://evil.com/x 정상'
     cleaned = sanitize(dirty)
