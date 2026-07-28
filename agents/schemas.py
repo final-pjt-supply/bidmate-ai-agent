@@ -56,6 +56,23 @@ class FailedReason(BaseModel):
     actual: str
 
 
+class AxisResult(BaseModel):
+    """9축 체크리스트 한 줄. 미달 축뿐 아니라 충족 축도 그대로 싣는다.
+
+    failed_reasons는 "왜 안 되는가"만 담아서, 화면이 "무엇을 확인했는가"를
+    보여줄 수 없다. 충족 축이 안 내려가면 '가능' 판정은 근거 없는 결론으로
+    보이고, 회원은 자기가 이미 채운 조건을 확인할 수 없다.
+
+    class(gate/supp/info)는 파이썬 예약어라 axis_class로 받는다.
+    """
+    axis: str
+    axis_class: Literal["gate", "supp", "info"]
+    status: Literal["충족", "미충족", "확인필요"]
+    required: str = ""   # 공고가 요구하는 값
+    actual: str = ""     # 회원이 보유한 값
+    detail: str = ""     # 사람이 읽는 한 줄 (하위호환)
+
+
 class EligibilityResult(BaseModel):
     bid_id: str
     passed: bool
@@ -64,6 +81,13 @@ class EligibilityResult(BaseModel):
     # 기본값 None이라 기존 stub·호출부는 무변경으로 그대로 동작한다.
     verdict: Literal["가능", "불가", "보완가능", "확인필요"] | None = None
     failed_reasons: list[FailedReason] = []
+
+    # ↓ 9축 체크리스트용. 전부 기본값이 있어 기존 호출부는 무변경으로 동작한다.
+    #   failed_reasons는 respond.py(A 소유)가 쓰므로 그대로 둔다 — 대체가 아니라 추가다.
+    axes: list[AxisResult] = []
+    required_count: int = 0    # 판정에 참여한 축 수 (info 제외)
+    satisfied_count: int = 0
+    need_review_count: int = 0
 
 
 class Chunk(BaseModel):
