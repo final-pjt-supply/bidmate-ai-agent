@@ -58,14 +58,22 @@ def test_보완가능은_통과가_아니지만_verdict로_구분된다():
 
 
 def test_표시축_info는_실패사유에서_빠진다():
-    """인증(info)은 N/M 판정에 참여하지 않으므로 사유로 올리면 오해를 준다."""
+    """인증·신용(info)은 N/M 판정에 참여하지 않으므로 사유로 올리면 오해를 준다.
+
+    credit은 2026-07-28(3차)에 supp → info로 내려갔다. _to_result는 class만
+    보고 거르므로, 여기에 credit을 세워두지 않으면 SQL이 credit을 supp로
+    되돌려도 어떤 테스트도 깨지지 않는다.
+    """
     row = _row("확인필요", [
         {"axis": "cert", "class": "info", "status": "미충족", "detail": "ISO9001"},
+        {"axis": "credit", "class": "info", "status": "미충족", "detail": "AA- 이상"},
         {"axis": "capacity", "class": "supp", "status": "확인필요", "detail": "시공능력"},
     ])
     result = _to_result(row)
     assert result.verdict == "확인필요"
     assert [r.field for r in result.failed_reasons] == ["capacity"]
+    # 사유에서만 빠지는 것이지 화면에서까지 사라지면 안 된다
+    assert {a.axis for a in result.axes} == {"cert", "credit", "capacity"}
 
 
 def test_detail이_비면_status로_폴백한다():

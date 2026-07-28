@@ -56,10 +56,13 @@ COMPANY_ID = os.getenv("LIVE_COMPANY_ID", "9001")
 VERDICTS = {"가능", "불가", "보완가능", "확인필요"}
 STATUSES = {"충족", "미충족", "확인필요"}
 AXES = {
-    "license", "region", "size", "direct_prod",      # gate
-    "item", "personnel", "performance", "capacity", "credit",  # supp
-    "cert",                                          # info
+    "license", "region", "size", "direct_prod",       # gate
+    "item", "personnel", "performance", "capacity",   # supp
+    "cert", "credit",                                 # info
 }
+# credit 은 2026-07-28(3차)에 supp → info 로 내려갔다. verdict 분모에서 빠졌고
+# 실패 사유로도 올라가면 안 된다. 아래 test_info축은_사유에서_빠진다 가 지킨다.
+INFO_AXES = {"cert", "credit"}
 
 # 7/24 측정 기준선. §4-3(on-read vs 사전계산) 판단의 기준점이다.
 # 2배 이상이면 아키텍처 선택이 바뀐다 — 그래서 실패시키지 않고 경고만 찍는다.
@@ -153,9 +156,81 @@ def test_사유의_축이름이_알려진_축이다(rows):
 
 
 def test_info축은_사유에서_빠진다(rows):
-    """cert 는 class='info' — 표시만 하고 판정에 관여하지 않는다."""
-    샌행 = [r.bid_id for r in rows for f in r.failed_reasons if f.field == "cert"]
-    assert not 샌행, f"info 축이 실패 사유로 샜다: {샌행[:5]}"
+    """cert·credit 은 class='info' — 표시만 하고 판정에 관여하지 않는다.
+
+    cert 만 보면 credit 이 supp 로 되돌아가도 통과한다. 3차 배포를 지키는 건
+    이 한 줄이다.
+    """
+    샌행 = [(r.bid_id, f.field) for r in rows for f in r.failed_reasons
+            if f.field in INFO_AXES]
+    assert not 샌행, f"info 축이 실패 사유로 샜다: {len(샌행)}건 {샌행[:5]}"
+
+
+def test_verdict가_축목록에서_다시_유도된다(rows):
+    """compute 의 CASE 를 파이썬에서 재현해 대조한다. [최대 구멍이었던 자리]
+
+    분기 '순서'가 곧 우선순위다(required=0 → gate_failed → need_review →
+    satisfied). 지금까지 이 순서가 뒤바뀌거나 카운터 정의가 틀어져도 깨지는
+    테스트가 하나도 없었다. 수치가 아니라 규칙을 박기 때문에 데이터가 변해도
+    안전하다.
+
+    axes 로부터 유도하는 이유: 집계 컬럼(required/satisfied/...)과 axes 가
+    같은 CTE 에서 나오므로, 둘을 대조하면 SQL 내부 불일치까지 같이 잡힌다.
+    """
+    def 유도(r):
+        판정축 = [a for a in r.axes if a.axis_class in ("gate", "supp")]
+        if not 판정축:
+            return "확인필요"
+        if any(a.axis_class == "gate" and a.status == "미충족" for a in 판정축):
+            return "불가"
+        if any(a.status == "확인필요" for a in 판정축):
+            return "확인필요"
+        if sum(1 for a in 판정축 if a.status == "충족") < len(판정축):
+            return "보완가능"
+        return "가능"
+
+    어긋남 = [(r.bid_id, r.verdict, 유도(r)) for r in rows if r.verdict != 유도(r)]
+    assert not 어긋남, (
+        f"verdict/축목록 불일치 {len(어긋남)}건 (bid, SQL, 유도): {어긋남[:5]}"
+    )
+
+
+def test_보완가능과_확인필요에도_사유가_붙는다(rows):
+    """사유가 비면 화면이 회원에게 시킬 행동을 못 쓴다.
+
+    '확인필요' 는 두 갈래다 — 판정축 0개(분기1)와 need_review>0(분기3).
+    앞쪽은 사유가 없는 게 정상이라 required_count>0 일 때만 본다.
+    """
+    빈사유 = [
+        (r.bid_id, r.verdict) for r in rows
+        if not r.failed_reasons
+        and (r.verdict == "보완가능"
+             or (r.verdict == "확인필요" and r.required_count > 0))
+    ]
+    assert not 빈사유, f"사유 없는 {len(빈사유)}건: {빈사유[:5]}"
+
+
+def test_직생축_미충족이_회원데이터_부재에서_나오지_않는다(rows):
+    """[4차 가드] '회사 품목 미등록' 은 결격이 아니라 판단 불가다.
+
+    direct_prod 는 gate 라서 '미충족' 이면 곧 '불가' 고, 그 공고는
+    include_infeasible=false 기본값 때문에 회원 목록에서 아예 사라진다.
+    미충족은 '회원이 그 품목을 등록했는데 직생확인이 없거나 만료' 일 때만
+    성립해야 한다.
+
+    '미충족 0건' 을 박지 않는 이유: 그건 회사 9001 의 데이터 사정이지
+    불변식이 아니다. 회원이 품목을 등록하기 시작하면 미충족은 정상적으로
+    생겨야 한다. 여기서 보는 건 '판단 불가를 결격으로 찍었는가' 하나다.
+    """
+    모순 = [
+        (r.bid_id, a.actual) for r in rows for a in r.axes
+        if a.axis == "direct_prod" and a.status == "미충족"
+        and a.actual == "(회사 품목 미등록)"
+    ]
+    assert not 모순, (
+        f"직생 가드 회귀 {len(모순)}건: {모순[:5]} "
+        "— ax_direct_prod 의 n_nocomp 분기가 빠졌다"
+    )
 
 
 # ─────────────────────── 코드 vs SQL 대조 ───────────────────────
