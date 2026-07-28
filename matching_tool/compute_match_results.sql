@@ -259,6 +259,9 @@ dp_rows AS (
   SELECT i.bid_ntce_no, i.bid_ntce_ord,
          COUNT(*) AS n_req,
          COUNT(*) FILTER (WHERE i.item_code IS NULL) AS n_unres,
+         -- [D4-guard] 공고 품목은 해석됐는데 회원 company_items에 그 품목 행이 아예 없는 경우.
+         --            '직생 결격'이 아니라 '회원 데이터 부재'다. 미충족(=gate 불가)으로 찍으면 안 된다.
+         COUNT(*) FILTER (WHERE i.item_code IS NOT NULL AND ci.item_code IS NULL) AS n_nocomp,
          COUNT(*) FILTER (WHERE ci.item_code IS NOT NULL AND ci.has_direct_production
                             AND (ci.direct_prod_valid_until IS NULL
                                  OR ci.direct_prod_valid_until >= p.today_kst)) AS n_ok,
@@ -277,12 +280,17 @@ dp_rows AS (
 ),
 ax_direct_prod AS (
   SELECT bid_ntce_no, bid_ntce_ord, 'direct_prod' AS axis, 'gate' AS class,
-         CASE WHEN n_ok = n_req           THEN '충족'
-              WHEN n_ok + n_unres = n_req THEN '확인필요'
+         -- [D4-guard] 미충족은 '회원이 그 품목을 등록했는데 직생확인이 없거나 만료'일 때만.
+         --            미해석(n_unres) / 회원 미등록(n_nocomp)은 판단 불가 → 확인필요.
+         CASE WHEN n_ok = n_req                            THEN '충족'
+              WHEN n_ok + n_unres + n_nocomp = n_req       THEN '확인필요'
               ELSE '미충족' END AS status,
-         '직생확인 ' || n_ok || '/' || n_req AS detail,
+         '직생확인 ' || n_ok || '/' || n_req
+           || CASE WHEN n_nocomp > 0 THEN ' · 회사 품목 미등록 ' || n_nocomp ELSE '' END
+           || CASE WHEN n_unres  > 0 THEN ' · 공고 품목 미해석 ' || n_unres  ELSE '' END AS detail,
          COALESCE(left(req_names, 300), '(미해석)')                                    AS req_value,
-         COALESCE(left(ok_names, 300), '(없음)')                                       AS act_value
+         COALESCE(left(ok_names, 300),
+                  CASE WHEN n_nocomp > 0 THEN '(회사 품목 미등록)' ELSE '(없음)' END)     AS act_value
   FROM dp_rows
 ),
 
