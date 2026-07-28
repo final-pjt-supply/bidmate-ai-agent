@@ -86,9 +86,27 @@
 --       (required=0 인 행은 정의상 전부 '가능' 쪽에만 있었다).
 --   해당하는 두 경우를 한 분기가 같이 잡는다:
 --     ① per_bid LEFT JOIN 미스 — bid_require_* 에 행 자체가 없음
---     ② class='info'(cert) 축만 있음 — 표시용이라 판정 분모에 안 들어감
+--     ② class='info'(cert·credit) 축만 있음 — 표시용이라 판정 분모에 안 들어감
 --   ※ 이건 대증요법이 아니라 판정 규칙 자체의 수정이다. 근본 원인(추출 실패)은
 --     정규화 개선으로 축이 채워지면 자연히 이 분기에 안 걸리게 된다.
+--
+-- 2026-07-28  [신용축 강등] credit 을 supp → info 로 내린다.
+--   credit_rating_req 근거 스니펫을 전수 조사한 결과(대상 3,611건):
+--     · 임계 요건("BBB 이상이어야 참가 가능")을 담은 공고 = 0건
+--     · 등급 토큰이 등장하는 12건은 전부 조달청 적격심사 **배점표** 인용이다
+--       (회사채|기업어음|기업신용평가 3열 표 → 배점의 100/95/90/70%).
+--     · 나머지는 "신용평가등급확인서 제출", "경영상태는 신용평가등급으로 평가"
+--       같은 서류 안내·평가방법 문구다.
+--   즉 credit 은 입찰 참가 **자격**이 아니라 낙찰자 결정 **배점 항목**이었다.
+--   덧붙여 min_grade 는 전건 NULL 이라 애초에 비교할 임계값이 없다.
+--   supp 로 두면 신용등급 미입력 회사에서 587건이 통째로 '미충족'이 되는
+--   위양성이 생긴다 — 9001(BBB 보유)로는 전부 '충족'이라 보이지 않던 결함이다.
+--   실측(회사 9001, 2026-07-28 라이브 1,323건): credit 축 보유 587건.
+--     → 587건에서 required·satisfied 가 나란히 1씩 감소(대소관계 보존, verdict 불변).
+--       credit 이 유일한 판정축이던 15건만 required=0 → '확인필요' 로 이동.
+--   ※ 축을 지우지 않는다. axes 배열에는 info 로 남아 화면에 표시되고,
+--     배점표는 D4 스코어링(낙찰 가능성 점수)에서 그대로 쓸 자산이다.
+--   ※ 되돌리려면 ax_credit 의 class 리터럴만 'supp' 로 복원하면 된다.
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -418,7 +436,7 @@ ax_capacity AS (
   FROM cap_rows GROUP BY 1,2
 ),
 
--- ═══════════════ ⑧ 신용 (supp) — 위양성 가드 ═══════════════
+-- ═══════════════ ⑧ 신용 (info) — 배점 항목이라 판정 제외 ═══════════════
 -- credit_rating_req 근거 스니펫만 뽑는다. extraction_evidence 는 두 세대로 shape 가 다르다:
 --   구(백필) = [{page, field, snippet}, ...]        · 신(일일) = {field: [{page, snippet, ...}]}
 credit_ev AS (
@@ -444,7 +462,9 @@ credit_fp AS (
   HAVING BOOL_AND(snip ~ '(채무불이행|금융질서\s*문란|신용정보\s*관리규약)')
 ),
 ax_credit AS (
-  SELECT c.bid_ntce_no, c.bid_ntce_ord, 'credit' AS axis, 'supp' AS class,
+  -- [강등] 'supp' → 'info'. 신용평가등급은 참가자격이 아니라 적격심사 배점 항목이다.
+  --        info 는 required/satisfied 집계에서 빠진다(per_bid 참조). 상단 이력 참조.
+  SELECT c.bid_ntce_no, c.bid_ntce_ord, 'credit' AS axis, 'info' AS class,
          CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '충족'   -- ← 가드: 위양성. 지우면 원복.
               WHEN NOT c.required THEN '충족'
               WHEN c.min_grade IS NOT NULL THEN '확인필요'   -- v1 도달 불가(min_grade 전건 NULL)
