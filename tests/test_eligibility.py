@@ -139,3 +139,58 @@ def test_D3_새_키가_빈_문자열이면_폴백한다():
     reason = _to_result(row).failed_reasons[0]
     assert reason.required == "sme_only vs (미등록)"
     assert reason.actual == "미충족"
+
+
+# ─────────────── axes 패스스루 (9축 체크리스트, 2026-07-28) ───────────────
+# failed_reasons는 "왜 안 되는가"만 담는다. 화면이 "무엇을 확인했는가"까지
+# 보여주려면 충족 축도 내려가야 한다. 아래는 그 통로가 막히지 않는지 본다.
+
+def test_axes는_충족_축까지_전부_실린다():
+    row = _row("보완가능", [
+        {"axis": "license", "class": "gate", "status": "충족",
+         "detail": "전기공사업", "required": "전기공사업", "actual": "전기공사업"},
+        {"axis": "performance", "class": "supp", "status": "미충족",
+         "detail": "실적 10억", "required": "10억원", "actual": "3억원"},
+        {"axis": "cert", "class": "info", "status": "확인필요",
+         "detail": "ISO9001", "required": "ISO9001", "actual": "(미해석)"},
+    ])
+    result = _to_result(row)
+
+    assert [a.axis for a in result.axes] == ["license", "performance", "cert"]
+    assert [a.axis_class for a in result.axes] == ["gate", "supp", "info"]
+
+    # 충족 축은 failed_reasons에는 없고 axes에만 있다 — 이게 추가의 이유다.
+    assert "license" not in {r.field for r in result.failed_reasons}
+    assert result.axes[0].actual == "전기공사업"
+
+    # info 축도 axes에는 남는다 (판정엔 관여 안 하지만 화면엔 보여야 한다)
+    assert result.axes[2].axis == "cert"
+
+
+def test_axes_집계값이_그대로_넘어온다():
+    row = _row("확인필요", [])
+    row.update(required=9, satisfied=6, need_review=2)
+    result = _to_result(row)
+    assert (result.required_count, result.satisfied_count,
+            result.need_review_count) == (9, 6, 2)
+
+
+def test_axes가_없어도_빈_리스트다():
+    """구버전 DB·집계 컬럼 누락 어느 쪽이든 터지지 않는다."""
+    assert _to_result(_row("가능", None)).axes == []
+    assert _to_result({"bid_id": "x", "verdict": "가능", "axes": []}).axes == []
+
+
+def test_모르는_축이_와도_나머지는_살아남는다():
+    """축 하나가 이상하다고 공고 전체가 사라지면 안 된다."""
+    row = _row("불가", [
+        {"axis": "region", "class": "gate", "status": "미충족",
+         "detail": "대전 제한", "required": "대전", "actual": "서울"},
+        {"axis": "미래축", "class": "unknown", "status": "미충족"},   # 모르는 class
+        {"axis": "region", "class": "gate", "status": "???"},        # 모르는 status
+        "문자열",                                                     # dict도 아님
+    ])
+    result = _to_result(row)
+    assert [a.axis for a in result.axes] == ["region"]
+    # 사유 쪽도 마찬가지 — 모르는 class/status는 원래부터 걸러진다
+    assert [r.field for r in result.failed_reasons] == ["region"]

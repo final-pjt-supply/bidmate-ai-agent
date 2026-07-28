@@ -74,6 +74,21 @@
 --     근본 수정은 어댑터(인수분해 + 다중 코드 추출) + 재정규화.
 --   ※ 병합은 느슨한 쪽 오류를 택한 것이다. gate 축에서 과조임은 참여 가능한 공고를
 --     숨겨 사용자가 존재조차 모르게 하지만, 느슨하면 bid_ntce_dtl_url 로 확인 가능하다.
+--
+-- 2026-07-28  [축0개] 판정축이 하나도 없는 공고를 '가능'으로 내던 위양성 차단.
+--   verdict CASE 에 required=0 분기를 **맨 앞에** 넣는다.
+--   required=0 이면 gate_failed=0·need_review=0·satisfied=0 이라
+--   기존 CASE 가 전부 흘러내려 마지막 ELSE '가능' 에 걸렸다.
+--   축 0개는 "요구조건이 없다"가 아니라 "공고에서 조건을 못 뽑아냈다"이다.
+--   전자면 '가능'이 맞지만 후자다 — 라이브에서 근거 0줄짜리 '지원 가능' 배지가 된다.
+--   실측(회사 9001, 2026-07-28 라이브 1,257건): 가능 270건 중 92건(34.1%)이 축 0개.
+--     → 가능 270 → 178, 확인필요 131 → 223. 다른 verdict 는 이동 없음
+--       (required=0 인 행은 정의상 전부 '가능' 쪽에만 있었다).
+--   해당하는 두 경우를 한 분기가 같이 잡는다:
+--     ① per_bid LEFT JOIN 미스 — bid_require_* 에 행 자체가 없음
+--     ② class='info'(cert) 축만 있음 — 표시용이라 판정 분모에 안 들어감
+--   ※ 이건 대증요법이 아니라 판정 규칙 자체의 수정이다. 근본 원인(추출 실패)은
+--     정규화 개선으로 축이 채워지면 자연히 이 분기에 안 걸리게 된다.
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -508,7 +523,8 @@ per_bid AS (
 )
 SELECT p.company_id,
        s.bid_ntce_no, s.bid_ntce_ord,
-       CASE WHEN COALESCE(b.gate_failed,0) > 0 THEN '불가'
+       CASE WHEN COALESCE(b.required,0) = 0    THEN '확인필요'   -- [축0개] 아래 주석
+            WHEN COALESCE(b.gate_failed,0) > 0 THEN '불가'
             WHEN COALESCE(b.need_review,0) > 0 THEN '확인필요'
             WHEN COALESCE(b.satisfied,0) < COALESCE(b.required,0) THEN '보완가능'
             ELSE '가능' END::TEXT,

@@ -24,8 +24,14 @@ axes 항목은 [{axis, class(gate|supp|info), status(충족|미충족|확인필�
 """
 from __future__ import annotations
 
-from agents.clients.postgres import get_cursor
-from agents.schemas import EligibilityResult, FailedReason
+from agents.schemas import AxisResult, EligibilityResult, FailedReason
+
+# get_cursor는 _fetch 안에서 늦게 import한다(모듈 최상단 아님).
+# 이 모듈에는 DB를 전혀 안 타는 순수 매핑(_to_result·_to_axes)이 같이 있는데,
+# 최상단에서 psycopg를 끌어오면 그 매핑을 테스트하거나 재사용하려는 쪽까지
+# DB 드라이버와 접속 설정을 갖추도록 강요하게 된다.
+# 백엔드가 이 모듈을 import하는 시점(프로세스 기동)과 실제로 DB를 쓰는 시점을
+# 분리하는 효과도 있다.
 
 # '통과'로 볼 verdict. passed(bool)는 '가능'만 True. 4-state 원문은
 #   EligibilityResult.verdict 필드로 그대로 보존한다(D2(B) 결정).
@@ -35,6 +41,8 @@ _PASS_VERDICTS = {"가능"}
 _FAIL_STATUSES = {"미충족", "확인필요"}
 # 표시축(인증=info)은 N/M 미참여 → 실패 사유에서 제외. 게이트·보완 다 포함(D3 결정).
 _REASON_CLASSES = {"gate", "supp"}
+_AXIS_CLASSES = {"gate", "supp", "info"}
+_STATUSES = {"충족", "미충족", "확인필요"}
 
 
 def evaluate_eligibility(
@@ -77,6 +85,8 @@ def _fetch(company_id: str, bid_ids: list[str] | None) -> list[dict]:
         JOIN bid_table bt USING (bid_ntce_no, bid_ntce_ord)
         {where}
     """
+    from agents.clients.postgres import get_cursor
+
     with get_cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchall()
@@ -102,6 +112,8 @@ def _to_result(row: dict) -> EligibilityResult:
     reasons: list[FailedReason] = []
     if not passed:
         for ax in (row.get("axes") or []):
+            if not isinstance(ax, dict):
+                continue
             if (ax.get("class") in _REASON_CLASSES
                     and ax.get("status") in _FAIL_STATUSES):
                 reasons.append(FailedReason(
@@ -120,4 +132,37 @@ def _to_result(row: dict) -> EligibilityResult:
         passed=passed,
         verdict=row["verdict"],        # 게이트 3-state 원문 보존 (D2(B))
         failed_reasons=reasons,
+        axes=_to_axes(row.get("axes")),
+        required_count=row.get("required") or 0,
+        satisfied_count=row.get("satisfied") or 0,
+        need_review_count=row.get("need_review") or 0,
     )
+
+
+def _to_axes(raw: object) -> list[AxisResult]:
+    """axes jsonb 전체를 그대로 내려보낸다 (9축 체크리스트용).
+
+    failed_reasons는 미달 축만 담는다. 화면이 "무엇을 확인했는가"까지
+    보여주려면 충족 축도 있어야 하는데, 지금까지 _fetch가 SELECT해온
+    m.axes를 여기서 통째로 버리고 있었다.
+
+    상류가 이상한 값을 주면 조용히 건너뛴다 — 축 하나 때문에 공고
+    전체가 사라지는 것보다, 그 축만 빠지고 나머지가 보이는 편이 낫다.
+    (Literal 검증에 걸리는 경우가 이에 해당한다.)
+    """
+    out: list[AxisResult] = []
+    for ax in (raw or []):
+        if not isinstance(ax, dict):
+            continue
+        cls, status = ax.get("class"), ax.get("status")
+        if cls not in _AXIS_CLASSES or status not in _STATUSES:
+            continue
+        out.append(AxisResult(
+            axis=str(ax.get("axis") or ""),
+            axis_class=cls,
+            status=status,
+            required=str(ax.get("required") or ""),
+            actual=str(ax.get("actual") or ""),
+            detail=str(ax.get("detail") or ""),
+        ))
+    return out

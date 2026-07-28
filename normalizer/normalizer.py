@@ -134,6 +134,7 @@ _LIC_UMBRELLA = {
         "소프트웨어사업자(데이터베이스제작및검색서비스사업)",
     ],
 }
+
 # 규칙 ④: 무시 목록 (면허가 아닌 것) — v1.2: 등록증·허가증·조합 등재 추가 (7/22 표본 검수)
 _LIC_IGNORE = re.compile(
     r"확인서|증명서|고유번호|품질인증|입찰참가자격등록을 한 자|공급인증|성적서"
@@ -162,11 +163,9 @@ _LIC_WRAPPER = [
     (re.compile(r"^종합건설업\((.+)\)$"), r"\1"),
 ]
 
-
 def _lic_lookup(ctx: LookupContext, text: str):
     """v1.5: canon_key가 양쪽에 적용되므로 단일 조회로 충분 (쉼표·구두점·공백 변형 흡수)."""
     return ctx.find("license", text)
-
 
 def _strip_suffixes(text: str) -> str:
     t = text
