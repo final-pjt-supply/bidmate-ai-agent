@@ -8,7 +8,7 @@ search.py·bid_info.py와 같은 규약을 따른다:
 - 노드는 이 도구를 호출만 한다(내부 구조를 모른다).
 
 DB 함수는 on-read(호출 시점 계산)이고 살아있는 공고만 대상으로 한다
-(내부에서 bid_clse_dt로 필터). verdict는 게이트 3-state:
+(내부에서 bid_clse_dt로 필터). verdict는 4-state:
   '가능' / '불가' / '보완가능' / '확인필요'
 axes 항목은 [{axis, class(gate|supp|info), status(충족|미충족|확인필요),
   detail, required, actual}].
