@@ -3,7 +3,7 @@
 --   2026-07-24. 02 엔진을 DB 함수로 감쌈. 매칭 로직의 단일 정본.
 --
 -- 무엇:
---   회사 1곳 × **라이브 공고**(투찰마감 bid_clse_dt 미도래)만 9축 매칭 → verdict 행 반환.
+--   회사 1곳 × **라이브 공고**(투찰마감 bid_clse_dt 미도래)만 10축 매칭 → verdict 행 반환.
 --   RETURNS TABLE 이라 두 가지로 다 쓸 수 있음:
 --     · on-read (실시간)  : SELECT * FROM compute_match_results(9001);
 --     · precompute(캐시)  : INSERT INTO match_results (...) SELECT * FROM compute_match_results(9001);
@@ -107,6 +107,34 @@
 --   ※ 축을 지우지 않는다. axes 배열에는 info 로 남아 화면에 표시되고,
 --     배점표는 D4 스코어링(낙찰 가능성 점수)에서 그대로 쓸 자산이다.
 --   ※ 되돌리려면 ax_credit 의 class 리터럴만 'supp' 로 복원하면 된다.
+--
+-- 2026-07-29  [Phase1] 최종 마일스톤 1단계 — 정책 전가 + 축 재배치 + 판정 가드.
+--   결정 기록: 프로젝트 claude/final_milestone_2026-07-29.md. 결함 번호는
+--   claude/defect_register_2026-07-29.md 기준.
+--   ◆ 정책 원칙 확정: 회원측 데이터 부재 → '미충족' / 공고측 데이터 미해석 → '확인필요'.
+--     회원이 채울 수 있는 정보의 공백은 회원 책임으로 전가한다(D-10 은 결함 아닌 사양).
+--       · ax_region      본점 미등록        확인필요 → 미충족
+--       · ax_size        규모 미입력        확인필요 → 미충족
+--       · ax_direct_prod 회사 품목 미등록   확인필요 → 미충족
+--     ※ 존재하지 않는 company_id 호출의 구분은 함수가 하지 않는다 — 백엔드가 인증된
+--        회원으로만 호출한다는 전제(백엔드 계층 책임).
+--   ◆ 축 재배치: item supp → gate, direct_prod gate → supp.
+--     품목 '등록'은 참가 자격이고, 직생확인서는 취득 절차가 있는 보완 가능 서류다.
+--     item_rows 의 직생행 제외 필터(WHERE NOT direct_production_req)를 걷어냈다 —
+--     '등록' 판정은 전 품목이 게이트(ax_item)에서, '직생확인' 판정만 supp(ax_direct_prod)
+--     에서 본다. 안 걷으면 직생요구 품목(더 엄격한 요구)의 등록 여부가 더 느슨한 축으로
+--     빠지는 역전이 생긴다. 부작용: 직생 placeholder(품목 미상, item_code NULL) 행이
+--     게이트 확인필요로 유입 — 공고측 미해석이므로 원칙 부합.
+--   ◆ [D-06] 인력·시공능력 dedup — 동일 요건 반복 적재(첨부 병합 중복)로 분모 부풀림
+--     (실측 인력 503→245, 시공능력 137→84). 완전 동일 행만 접는다. 표기만 다른
+--     부분 변형(라벨 상이·코드 동일 등)은 lic_dedup 같은 키 설계가 필요해 v2.
+--   ◆ [D-07] min_value <= 0 가드 — 실적·시공능력 임계 0 이하는 비교식이 무조건 참이
+--     되어 위양성 '충족'이 나던 것(라이브 54건). 미해석과 동일 취급 → 확인필요.
+--   ◆ [D-11] ax_size detail 한글화 — 10축 중 유일하게 코드 대 코드(sme_only vs medium)
+--     로 노출되던 detail 을 req_value/act_value 재사용으로 교체. 프론트는 detail 바인딩.
+--   ◆ cert·credit 은 이번 단계에서 info 유지. 격상은 Phase 2(route_cert 되먹임·
+--     cert_master 보강·min_grade 파싱·v1.9 재정규화) 후 해석률 실측을 보고 Phase 3 에서.
+--     credit 격상 시에도 min_grade 파싱된 행만 supp(등급 미상은 축 미생성 — 배점 혼입 방지).
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -208,11 +236,13 @@ reg_rows AS (
 ax_region AS (
   SELECT s.bid_ntce_no, s.bid_ntce_ord, 'region' AS axis, 'gate' AS class,
          CASE WHEN rr.any_nationwide OR rr.hq_match THEN '충족'
-              WHEN NOT EXISTS (SELECT 1 FROM hq)    THEN '확인필요'
+              -- [Phase1 정책] 본점 미등록은 종전 확인필요 → 미충족. 회원측 부재는 회원 책임.
+              WHEN NOT EXISTS (SELECT 1 FROM hq)    THEN '미충족'
               WHEN rr.any_unresolved                THEN '확인필요'
               ELSE '미충족' END AS status,
          CASE WHEN rr.any_nationwide THEN '전국 (제한없음)'
               WHEN rr.hq_match       THEN '본점 소재지 충족'
+              WHEN NOT EXISTS (SELECT 1 FROM hq) THEN '본점 소재지 미등록'
               ELSE '요구 지역 불일치/미해석' END AS detail,
          CASE WHEN rr.any_nationwide THEN '전국 (제한없음)'
               ELSE COALESCE(left(rr.req_regions, 300), '(미해석)') END               AS req_value,
@@ -228,39 +258,49 @@ comp_qual AS (
   SELECT q.* FROM company_qualifications q CROSS JOIN params p WHERE q.company_id = p.company_id
 ),
 ax_size AS (
-  SELECT z.bid_ntce_no, z.bid_ntce_ord, 'size' AS axis, 'gate' AS class,
-         CASE WHEN cq.company_id IS NULL THEN '확인필요'
-              WHEN z.size_limit = 'sme_only'   AND cq.company_size IN ('small','medium') THEN '충족'
-              WHEN z.size_limit = 'small_only' AND cq.company_size = 'small'             THEN '충족'
-              WHEN z.size_limit IN ('no_large','no_conglomerate')
-                   AND cq.company_size <> 'conglomerate' THEN '충족'
-              ELSE '미충족' END AS status,
-         z.size_limit || ' vs ' || COALESCE(cq.company_size,'(미등록)') AS detail,
-         -- [D3-b] 코드 → 한글 라벨. CHECK 제약값과 1:1 (bid_require.sql / company_info.sql).
-         CASE z.size_limit
-           WHEN 'sme_only'        THEN '중소기업만'
-           WHEN 'small_only'      THEN '소기업만'
-           WHEN 'no_large'        THEN '대기업 제외'
-           WHEN 'no_conglomerate' THEN '대기업집단 제외'
-           ELSE COALESCE(z.size_limit, '(미해석)') END                                 AS req_value,
-         CASE cq.company_size
-           WHEN 'small'        THEN '소기업'
-           WHEN 'medium'       THEN '중기업'
-           WHEN 'mid_large'    THEN '중견기업'
-           WHEN 'conglomerate' THEN '대기업집단'
-           ELSE COALESCE(cq.company_size, '(미등록)') END                              AS act_value
-  FROM bid_require_size z
-  JOIN live_bids lb ON lb.bid_ntce_no = z.bid_ntce_no AND lb.bid_ntce_ord = z.bid_ntce_ord
-  LEFT JOIN comp_qual cq ON TRUE
+  -- [D-11/Phase1] detail 이 코드 대 코드(sme_only vs medium)로 노출되던 것을
+  --   req_value/act_value(한글 라벨) 재사용으로 교체. 프론트는 detail 에 바인딩한다.
+  SELECT bid_ntce_no, bid_ntce_ord, axis, class, status,
+         req_value || ' 요구 · 우리 회사 ' || act_value AS detail,
+         req_value, act_value
+  FROM (
+    SELECT z.bid_ntce_no, z.bid_ntce_ord, 'size' AS axis, 'gate' AS class,
+           -- [Phase1 정책] 규모 미입력(company_qualifications 행 없음)은 종전 확인필요 → 미충족.
+           CASE WHEN cq.company_id IS NULL THEN '미충족'
+                WHEN z.size_limit = 'sme_only'   AND cq.company_size IN ('small','medium') THEN '충족'
+                WHEN z.size_limit = 'small_only' AND cq.company_size = 'small'             THEN '충족'
+                WHEN z.size_limit IN ('no_large','no_conglomerate')
+                     AND cq.company_size <> 'conglomerate' THEN '충족'
+                ELSE '미충족' END AS status,
+           -- [D3-b] 코드 → 한글 라벨. CHECK 제약값과 1:1 (bid_require.sql / company_info.sql).
+           CASE z.size_limit
+             WHEN 'sme_only'        THEN '중소기업만'
+             WHEN 'small_only'      THEN '소기업만'
+             WHEN 'no_large'        THEN '대기업 제외'
+             WHEN 'no_conglomerate' THEN '대기업집단 제외'
+             ELSE COALESCE(z.size_limit, '(미해석)') END                               AS req_value,
+           CASE cq.company_size
+             WHEN 'small'        THEN '소기업'
+             WHEN 'medium'       THEN '중기업'
+             WHEN 'mid_large'    THEN '중견기업'
+             WHEN 'conglomerate' THEN '대기업집단'
+             ELSE COALESCE(cq.company_size, '(미등록)') END                            AS act_value
+    FROM bid_require_size z
+    JOIN live_bids lb ON lb.bid_ntce_no = z.bid_ntce_no AND lb.bid_ntce_ord = z.bid_ntce_ord
+    LEFT JOIN comp_qual cq ON TRUE
+  ) t
 ),
 
--- ═══════════════ ④a 직생 (gate) ═══════════════
+-- ═══════════════ ④a 직생 (supp — Phase1 격하) ═══════════════
+--   직접생산확인증명서는 취득 절차가 있는 보완 가능 서류라 gate 가 아니라 supp 다.
+--   '품목 등록' 자체의 판정은 ④b ax_item(gate)이 전 품목에 대해 수행한다.
 dp_rows AS (
   SELECT i.bid_ntce_no, i.bid_ntce_ord,
          COUNT(*) AS n_req,
          COUNT(*) FILTER (WHERE i.item_code IS NULL) AS n_unres,
-         -- [D4-guard] 공고 품목은 해석됐는데 회원 company_items에 그 품목 행이 아예 없는 경우.
-         --            '직생 결격'이 아니라 '회원 데이터 부재'다. 미충족(=gate 불가)으로 찍으면 안 된다.
+         -- [Phase1 정책] 공고 품목은 해석됐는데 회원 company_items 에 그 품목 행이 없는 경우.
+         --   종전엔 '판단 불가 → 확인필요'로 뒀으나(구 D4-guard), 회원측 부재는 회원
+         --   책임으로 전가한다(2026-07-29 결정) → 미충족. supp 라 verdict 는 '보완가능' 쪽.
          COUNT(*) FILTER (WHERE i.item_code IS NOT NULL AND ci.item_code IS NULL) AS n_nocomp,
          COUNT(*) FILTER (WHERE ci.item_code IS NOT NULL AND ci.has_direct_production
                             AND (ci.direct_prod_valid_until IS NULL
@@ -279,11 +319,12 @@ dp_rows AS (
   GROUP BY 1,2
 ),
 ax_direct_prod AS (
-  SELECT bid_ntce_no, bid_ntce_ord, 'direct_prod' AS axis, 'gate' AS class,
-         -- [D4-guard] 미충족은 '회원이 그 품목을 등록했는데 직생확인이 없거나 만료'일 때만.
-         --            미해석(n_unres) / 회원 미등록(n_nocomp)은 판단 불가 → 확인필요.
-         CASE WHEN n_ok = n_req                            THEN '충족'
-              WHEN n_ok + n_unres + n_nocomp = n_req       THEN '확인필요'
+  SELECT bid_ntce_no, bid_ntce_ord, 'direct_prod' AS axis, 'supp' AS class,
+         -- [Phase1] 확인필요는 이제 공고측 미해석(n_unres)만. 회원 품목 미등록(n_nocomp)은
+         --          미충족으로 흘러내린다(정책 전가). 미해석+미등록 혼재 시에도 미충족 —
+         --          회원측 결격이 확정돼 있으면 나머지가 미해석이어도 결론은 같다.
+         CASE WHEN n_ok = n_req                THEN '충족'
+              WHEN n_ok + n_unres = n_req      THEN '확인필요'
               ELSE '미충족' END AS status,
          '직생확인 ' || n_ok || '/' || n_req
            || CASE WHEN n_nocomp > 0 THEN ' · 회사 품목 미등록 ' || n_nocomp ELSE '' END
@@ -294,7 +335,12 @@ ax_direct_prod AS (
   FROM dp_rows
 ),
 
--- ═══════════════ ④b 품목 등록 (supp) ═══════════════
+-- ═══════════════ ④b 품목 등록 (gate — Phase1 격상) ═══════════════
+--   [Phase1] 직생행 제외 필터(WHERE NOT direct_production_req)를 걷어냈다.
+--   '등록' 판정은 직생요구 여부와 무관하게 전 품목이 여기(게이트)를 지나고,
+--   직생요구 품목의 '직생확인' 판정만 ④a(supp)가 담당한다. 필터를 남기면
+--   더 엄격한 요구(직생요구 품목)의 등록 여부가 더 느슨한 축으로 빠지는 역전이 생긴다.
+--   직생 placeholder(품목 미상, item_code NULL)는 n_unres → 게이트 확인필요로 유입.
 item_rows AS (
   SELECT i.bid_ntce_no, i.bid_ntce_ord,
          COUNT(*) AS n_req,
@@ -307,11 +353,10 @@ item_rows AS (
   JOIN live_bids lb ON lb.bid_ntce_no = i.bid_ntce_no AND lb.bid_ntce_ord = i.bid_ntce_ord
   CROSS JOIN params p
   LEFT JOIN company_items ci ON ci.company_id = p.company_id AND ci.item_code = i.item_code
-  WHERE NOT i.direct_production_req
   GROUP BY 1,2
 ),
 ax_item AS (
-  SELECT bid_ntce_no, bid_ntce_ord, 'item' AS axis, 'supp' AS class,
+  SELECT bid_ntce_no, bid_ntce_ord, 'item' AS axis, 'gate' AS class,
          CASE WHEN n_ok = n_req           THEN '충족'
               WHEN n_ok + n_unres = n_req THEN '확인필요'
               ELSE '미충족' END AS status,
@@ -325,6 +370,17 @@ ax_item AS (
 comp_person_total AS (
   SELECT COALESCE(SUM(cp.headcount),0) AS total
   FROM company_personnel cp CROSS JOIN params p WHERE cp.company_id = p.company_id
+),
+-- [D-06] 동일 인력 요건의 반복 적재(첨부 병합 중복)가 분모를 부풀린다(실측 503→245).
+--   요건 정의 필드가 완전히 같은 행만 접는다. name_raw 는 키에서 뺀다 — 같은 요건이
+--   표기만 다르게 반복되는 사례를 접기 위해서다. 부분 변형(코드 동일·등급 상이 등)의
+--   키 설계는 v2(lic_dedup 의 grp_key 패턴 필요).
+pers_req AS (
+  SELECT DISTINCT r.bid_ntce_no, r.bid_ntce_ord,
+         r.qual_code, r.qual_name, r.role_field, r.grade_raw, r.headcount, r.method
+  FROM bid_require_personnel r
+  JOIN live_bids lb ON lb.bid_ntce_no = r.bid_ntce_no AND lb.bid_ntce_ord = r.bid_ntce_ord
+  WHERE COALESCE(r.method,'') <> 'ignored'
 ),
 pers_eval AS (
   SELECT r.bid_ntce_no, r.bid_ntce_ord,
@@ -347,10 +403,8 @@ pers_eval AS (
         COALESCE((SELECT cp.headcount FROM company_personnel cp CROSS JOIN params p
                    WHERE cp.company_id = p.company_id AND cp.qual_code = r.qual_code), 0) >= r.headcount
     END AS met
-  FROM bid_require_personnel r
-  JOIN live_bids lb ON lb.bid_ntce_no = r.bid_ntce_no AND lb.bid_ntce_ord = r.bid_ntce_ord
+  FROM pers_req r
   LEFT JOIN personnel_grade_master m ON m.qual_code = r.qual_code
-  WHERE COALESCE(r.method,'') <> 'ignored'
 ),
 ax_personnel AS (
   SELECT bid_ntce_no, bid_ntce_ord, 'personnel' AS axis, 'supp' AS class,
@@ -367,8 +421,9 @@ ax_personnel AS (
 perf_rows AS (
   SELECT r.id, r.bid_ntce_no, r.bid_ntce_ord,
          -- [D3-b] 이름 컬럼이 없어 필드에서 조립한다. category_raw(분야) + 기간 + 금액/건수.
+         -- [D-07] min_value <= 0 은 정규화 실패값 — 비교식이 무조건 참이 되므로 미해석 취급.
          CASE
-           WHEN r.min_value IS NULL OR r.unit IS NULL OR r.parse_status = 'unparsed'
+           WHEN r.min_value IS NULL OR r.min_value <= 0 OR r.unit IS NULL OR r.parse_status = 'unparsed'
              THEN COALESCE(left(NULLIF(r.category_raw,''), 40), '(미해석 실적요건)')
            ELSE COALESCE(left(NULLIF(r.category_raw,''), 40) || ' ', '')
                 || '최근 ' || r.period_years || '년 '
@@ -380,7 +435,7 @@ perf_rows AS (
                 || CASE WHEN r.agg_type = 'sum' THEN ' (합산)' ELSE '' END
          END AS label,
          CASE
-           WHEN r.min_value IS NULL OR r.unit IS NULL OR r.parse_status = 'unparsed' THEN NULL
+           WHEN r.min_value IS NULL OR r.min_value <= 0 OR r.unit IS NULL OR r.parse_status = 'unparsed' THEN NULL
            WHEN r.unit = '원' AND COALESCE(r.agg_type,'single') = 'single' THEN
              (SELECT COALESCE(MAX(pr.contract_amt),0) FROM company_performance_records pr, params p
                WHERE pr.company_id = p.company_id
@@ -412,16 +467,25 @@ ax_performance AS (
 ),
 
 -- ═══════════════ ⑦ 시공능력 (supp) ═══════════════
+-- [D-06] 동일 시공능력 요건의 반복 적재 접기(실측 137→84). (업종, 임계값, 파싱상태)가
+--   완전히 같은 행만 접는다. 미해석 다건이 1건으로 접히는 건 감수 — met 이 전부 NULL
+--   이라 판정 불변, 분모 표시만 보수적으로 준다.
+cap_req AS (
+  SELECT DISTINCT r.bid_ntce_no, r.bid_ntce_ord, r.license_code, r.min_value, r.parse_status
+  FROM bid_require_capacity r
+  JOIN live_bids lb ON lb.bid_ntce_no = r.bid_ntce_no AND lb.bid_ntce_ord = r.bid_ntce_ord
+),
 cap_rows AS (
-  SELECT r.id, r.bid_ntce_no, r.bid_ntce_ord,
+  SELECT r.bid_ntce_no, r.bid_ntce_ord,
          -- [D3-b] 업종(license_master) + 금액. license_code NULL 이면 총액 요건.
+         -- [D-07] min_value <= 0 은 정규화 실패값 → 미해석 취급.
          COALESCE(lm.license_name, '총액') || ' '
-           || CASE WHEN r.min_value IS NULL THEN '(미해석)'
+           || CASE WHEN r.min_value IS NULL OR r.min_value <= 0 THEN '(미해석)'
                    WHEN r.min_value >= 100000000
                      THEN trim(to_char(r.min_value / 100000000.0, 'FM9999990.9')) || '억원'
                    ELSE to_char(r.min_value::numeric, 'FM999,999,999,999') || '원' END AS label,
          CASE
-           WHEN r.min_value IS NULL OR r.parse_status = 'unparsed' THEN NULL
+           WHEN r.min_value IS NULL OR r.min_value <= 0 OR r.parse_status = 'unparsed' THEN NULL
            WHEN r.license_code IS NOT NULL THEN
              COALESCE((SELECT ce.eval_amount FROM company_capacity_evals ce, params p
                         WHERE ce.company_id = p.company_id AND ce.license_code = r.license_code),0) >= r.min_value
@@ -429,8 +493,7 @@ cap_rows AS (
              (SELECT COALESCE(SUM(ce.eval_amount),0) FROM company_capacity_evals ce, params p
                WHERE ce.company_id = p.company_id) >= r.min_value
          END AS met
-  FROM bid_require_capacity r
-  JOIN live_bids lb ON lb.bid_ntce_no = r.bid_ntce_no AND lb.bid_ntce_ord = r.bid_ntce_ord
+  FROM cap_req r
   LEFT JOIN license_master lm ON lm.license_code = r.license_code
 ),
 ax_capacity AS (
