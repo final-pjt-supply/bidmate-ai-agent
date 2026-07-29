@@ -58,11 +58,13 @@ STATUSES = {"충족", "미충족", "확인필요"}
 AXES = {
     "license", "region", "size", "direct_prod",       # gate
     "item", "personnel", "performance", "capacity",   # supp
-    "cert", "credit",                                 # info
+    "cert", "credit",                                 # supp (Phase3 격상)
 }
-# credit 은 2026-07-28(3차)에 supp → info 로 내려갔다. verdict 분모에서 빠졌고
-# 실패 사유로도 올라가면 안 된다. 아래 test_info축은_사유에서_빠진다 가 지킨다.
-INFO_AXES = {"cert", "credit"}
+# [Phase3 2026-07-29] cert·credit 이 supp 로 격상되고 info class 는 폐지됐다.
+#   3차의 info 강등은 인증 해석률 20% 시절의 잠정 조치였고, v1.9 재정규화로
+#   라이브 해석률 83%가 되면서 판정에 편입했다. credit 은 min_grade 파싱행만
+#   축이 생긴다(결정 3 — 배점표 혼입 차단). 아래 두 테스트가 이 상태를 지킨다:
+#   test_info_class는_폐지됐다 / test_credit축은_등급요구가_있는_행만_생긴다.
 
 # 7/24 측정 기준선. §4-3(on-read vs 사전계산) 판단의 기준점이다.
 # 2배 이상이면 아키텍처 선택이 바뀐다 — 그래서 실패시키지 않고 경고만 찍는다.
@@ -155,15 +157,27 @@ def test_사유의_축이름이_알려진_축이다(rows):
     assert not 미지축, f"모르는 축: {미지축}"
 
 
-def test_info축은_사유에서_빠진다(rows):
-    """cert·credit 은 class='info' — 표시만 하고 판정에 관여하지 않는다.
+def test_info_class는_폐지됐다(rows):
+    """[Phase3] class='info' 는 더 존재하지 않는다 — cert·credit 은 supp 로 판정 참여.
 
-    cert 만 보면 credit 이 supp 로 되돌아가도 통과한다. 3차 배포를 지키는 건
-    이 한 줄이다.
+    3차(info 강등)를 지키던 test_info축은_사유에서_빠진다 의 후속 방어선이다.
+    함수 쪽에서 축이 info 로 되돌아가면(원복 사고) 여기서 잡힌다.
     """
-    샌행 = [(r.bid_id, f.field) for r in rows for f in r.failed_reasons
-            if f.field in INFO_AXES]
-    assert not 샌행, f"info 축이 실패 사유로 샜다: {len(샌행)}건 {샌행[:5]}"
+    잔존 = [(r.bid_id, a.axis) for r in rows for a in r.axes
+            if a.axis_class == "info"]
+    assert not 잔존, f"info class 잔존 {len(잔존)}건: {잔존[:5]}"
+
+
+def test_credit축은_등급요구가_있는_행만_생긴다(rows):
+    """[Phase3/결정3] credit 축은 min_grade 가 파싱된 요구에만 선다.
+
+    등급 미상(boolean-only) 신용 요구는 적격심사 배점표 혼입이 다수라(3차 실측:
+    임계 요건 0건) 축을 만들지 않는다. 축이 있는데 required 가 'X 이상' 꼴이
+    아니면 grade_scale JOIN 필터가 빠진 회귀다.
+    """
+    회귀 = [(r.bid_id, a.required) for r in rows for a in r.axes
+            if a.axis == "credit" and not a.required.endswith("이상")]
+    assert not 회귀, f"등급 없는 credit 축 {len(회귀)}건: {회귀[:5]}"
 
 
 def test_verdict가_축목록에서_다시_유도된다(rows):
@@ -210,26 +224,75 @@ def test_보완가능과_확인필요에도_사유가_붙는다(rows):
     assert not 빈사유, f"사유 없는 {len(빈사유)}건: {빈사유[:5]}"
 
 
-def test_직생축_미충족이_회원데이터_부재에서_나오지_않는다(rows):
-    """[4차 가드] '회사 품목 미등록' 은 결격이 아니라 판단 불가다.
+def test_직생축은_supp이고_미등록은_미충족이다(rows):
+    """[Phase1 정책 전가] 회원측 데이터 부재는 '미충족', 직생확인은 보완축이다.
 
-    direct_prod 는 gate 라서 '미충족' 이면 곧 '불가' 고, 그 공고는
-    include_infeasible=false 기본값 때문에 회원 목록에서 아예 사라진다.
-    미충족은 '회원이 그 품목을 등록했는데 직생확인이 없거나 만료' 일 때만
-    성립해야 한다.
-
-    '미충족 0건' 을 박지 않는 이유: 그건 회사 9001 의 데이터 사정이지
-    불변식이 아니다. 회원이 품목을 등록하기 시작하면 미충족은 정상적으로
-    생겨야 한다. 여기서 보는 건 '판단 불가를 결격으로 찍었는가' 하나다.
+    4차 가드(미등록 → 확인필요)는 2026-07-29 결정 1로 뒤집혔다 — 회원이 채울 수
+    있는 정보의 공백은 회원 책임으로 확정 판정한다. 대신 direct_prod 가 supp 로
+    내려가, 미충족이어도 '불가'가 아니라 '보완가능' 쪽이다(공고가 목록에서
+    사라지지 않는다 — 4차 가드가 지키려던 실익은 축 격하가 이어받았다).
+    여기서 지키는 불변식 둘:
+      ① direct_prod 는 gate 로 회귀하지 않는다(회귀 시 미등록만으로 공고가 숨는다).
+      ② '(회사 품목 미등록)' 인데 '확인필요' 로 남으면 전가 정책 회귀다.
     """
-    모순 = [
-        (r.bid_id, a.actual) for r in rows for a in r.axes
-        if a.axis == "direct_prod" and a.status == "미충족"
-        and a.actual == "(회사 품목 미등록)"
-    ]
-    assert not 모순, (
-        f"직생 가드 회귀 {len(모순)}건: {모순[:5]} "
-        "— ax_direct_prod 의 n_nocomp 분기가 빠졌다"
+    게이트회귀 = [r.bid_id for r in rows for a in r.axes
+                  if a.axis == "direct_prod" and a.axis_class != "supp"]
+    assert not 게이트회귀, f"direct_prod 가 supp 가 아님: {게이트회귀[:5]}"
+
+    정책회귀 = [(r.bid_id, a.status) for r in rows for a in r.axes
+                if a.axis == "direct_prod" and a.actual == "(회사 품목 미등록)"
+                and a.status != "미충족"]
+    assert not 정책회귀, f"미등록인데 미충족이 아님 {len(정책회귀)}건: {정책회귀[:5]}"
+
+
+
+def test_인력_총원을_넘는_요구는_충족이_아니다():
+    """[D-19/v2.0] 헤드카운트 보존 불변식 — 초안 결함의 재발 방지.
+
+    분야 매칭(v2.0)의 관대 규칙(field_family NULL = 모든 계열 풀에 계상)이
+    총원 상한을 넘어 중복 계상되면 안 된다. 자격코드의 총 요구 인원이 회원의
+    총 보유 인원보다 큰 공고는 어떤 분야 배정으로도 충족이 불가능하다 —
+    그런데 인력 축이 '충족'이면 합산 보존 행(pers_qual_agg)이 빠진 회귀다.
+    v2.0 초안이 실제로 이 결함을 갖고 있었다(2026-07-29 발견·수정): NULL 인력이
+    계열 풀마다 중복 계상돼 1단계(v1.5)가 막은 공짜 통과가 되살아나는 구조였다.
+    등급형 자격은 상위 등급이 하위 요구를 채워 풀이 더 넓으므로 제외한다.
+    v1.5(합산)·v2.0(계열+합산) 모두에서 참이어야 하는 불변식이라 배포 전후 무관하다.
+    """
+    from agents.clients.postgres import get_cursor
+
+    sql = """
+        WITH req AS (            -- 요구측: (공고, 자격코드) 합산 — 분야 무시한 하한
+          SELECT bid_ntce_no, bid_ntce_ord, qual_code, SUM(headcount) AS need
+          FROM (SELECT DISTINCT bid_ntce_no, bid_ntce_ord, qual_code, qual_name,
+                                role_field, grade_raw, headcount, method
+                  FROM bid_require_personnel
+                 WHERE COALESCE(method,'') <> 'ignored') d
+          WHERE qual_code IS NOT NULL
+            AND qual_code NOT IN (SELECT qual_code FROM personnel_grade_master
+                                   WHERE qual_type = 'grade' AND grade_rank IS NOT NULL)
+          GROUP BY 1, 2, 3
+        ),
+        viol AS (                -- 총 보유 < 총 요구 = 어떤 분야 배정으로도 불가능
+          SELECT r.bid_ntce_no, r.bid_ntce_ord
+          FROM req r
+          LEFT JOIN (SELECT qual_code, SUM(headcount) AS have
+                       FROM company_personnel
+                      WHERE company_id = %s::bigint GROUP BY 1) h USING (qual_code)
+          GROUP BY 1, 2
+          HAVING BOOL_OR(COALESCE(h.have, 0) < r.need)
+        )
+        SELECT COUNT(*) AS n
+        FROM compute_match_results(%s::bigint) m
+        JOIN viol v ON v.bid_ntce_no = m.bid_ntce_no
+                   AND v.bid_ntce_ord = m.bid_ntce_ord,
+             LATERAL jsonb_array_elements(m.axes) ax
+        WHERE ax->>'axis' = 'personnel' AND ax->>'status' = '충족'
+    """
+    with get_cursor() as cur:
+        cur.execute(sql, [COMPANY_ID, COMPANY_ID])
+        n = cur.fetchone()["n"]
+    assert n == 0, (
+        f"총원 초과 요구인데 인력 축 '충족' {n}건 — 합산 보존(pers_qual_agg) 회귀"
     )
 
 

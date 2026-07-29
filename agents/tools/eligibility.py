@@ -10,8 +10,10 @@ search.py·bid_info.py와 같은 규약을 따른다:
 DB 함수는 on-read(호출 시점 계산)이고 살아있는 공고만 대상으로 한다
 (내부에서 bid_clse_dt로 필터). verdict는 4-state:
   '가능' / '불가' / '보완가능' / '확인필요'
-axes 항목은 [{axis, class(gate|supp|info), status(충족|미충족|확인필요),
+axes 항목은 [{axis, class(gate|supp), status(충족|미충족|확인필요),
   detail, required, actual}].
+  (Phase3 2026-07-29: info class 폐지 — cert·credit supp 격상. 파서는 과거
+   데이터 호환을 위해 info 를 여전히 수용하되, 신규 데이터에는 나타나지 않는다.)
   required/actual은 compute 2026-07-27 배포부터 실린다. detail은 사람이 읽는
   한 줄 요약으로 유지되며(하위호환), 기계가 쪼개는 용도가 아니다.
 
@@ -39,7 +41,8 @@ _PASS_VERDICTS = {"가능"}
 
 # failed_reasons에 담을 축 상태. '충족'은 제외.
 _FAIL_STATUSES = {"미충족", "확인필요"}
-# 표시축(인증=info)은 N/M 미참여 → 실패 사유에서 제외. 게이트·보완 다 포함(D3 결정).
+# 실패 사유 = gate·supp 전 축(D3). Phase3부터 cert·credit 도 supp 라 사유에 오른다.
+#   info 는 폐지됐지만, 과거 캐시·원복 사고 방어용으로 제외 필터 자체는 유지한다.
 _REASON_CLASSES = {"gate", "supp"}
 _AXIS_CLASSES = {"gate", "supp", "info"}
 _STATUSES = {"충족", "미충족", "확인필요"}

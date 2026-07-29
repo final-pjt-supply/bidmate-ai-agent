@@ -310,7 +310,12 @@ eval_results/
 
 # Claude Code 하네스 산출물
 .claude/
+<<<<<<< HEAD
+.DS_Store
+master table/.DS_Store
+=======
 
 
 # testing
 for_test/
+>>>>>>> origin/main
