@@ -135,6 +135,15 @@
 --   ◆ cert·credit 은 이번 단계에서 info 유지. 격상은 Phase 2(route_cert 되먹임·
 --     cert_master 보강·min_grade 파싱·v1.9 재정규화) 후 해석률 실측을 보고 Phase 3 에서.
 --     credit 격상 시에도 min_grade 파싱된 행만 supp(등급 미상은 축 미생성 — 배점 혼입 방지).
+--
+-- 2026-07-29(1.1)  [D-18] supp 3축(personnel·performance·capacity) 미해석 의미 통일.
+--   BOOL_AND 이 NULL(미해석 행)을 건너뛰어 '미해석+통과 혼재'가 충족이 됐다 —
+--   item·cert·direct_prod 는 미해석이 있으면 확인필요로 차단하는 것과 불일치.
+--   status 를 미충족(FALSE 존재) → 확인필요(NULL 존재) → 충족 순으로 교체.
+--   실측 노출(9001, 캐시 대조): '충족인데 미해석 보유' 11건 → 확인필요 이동 예상.
+--   [D-19 완화] 인력 라벨에 분야(role_field) 접두 — 분야별 요건의 반복 표시를 구분.
+--   평가의 분야 미반영(책임기술인 1명이 7개 분야 슬롯을 동시 충족 가능)은
+--   회원 스키마(company_personnel 분야 차원)+입력 UI 확장이 필요한 v2 = D-19.
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -385,7 +394,10 @@ pers_req AS (
 pers_eval AS (
   SELECT r.bid_ntce_no, r.bid_ntce_ord,
     -- [D3-b] 표시 라벨. grade_raw(원문) 우선 — '중급기술자 이상' 처럼 등급 조건이 살아 있다.
-    left(COALESCE(NULLIF(r.grade_raw,''), m.qual_name, r.qual_name, r.role_field, '인력'), 40)
+    -- [Phase1.1/D-19 완화] 분야(role_field)를 접두로 — 분야별 개별 요건이 '책임기술자 1명' ×7 로
+    --   반복 노출되던 것을 구분한다. 평가의 분야 반영(1명이 7분야 슬롯 동시 충족 가능)은 v2=D-19.
+    left(COALESCE(NULLIF(r.role_field,'') || ' ', '')
+         || COALESCE(NULLIF(r.grade_raw,''), m.qual_name, r.qual_name, '인력'), 40)
       || ' ' || r.headcount || '명' AS label,
     CASE
       WHEN r.qual_code IS NULL AND r.method = 'none' THEN NULL
@@ -408,9 +420,11 @@ pers_eval AS (
 ),
 ax_personnel AS (
   SELECT bid_ntce_no, bid_ntce_ord, 'personnel' AS axis, 'supp' AS class,
-         CASE WHEN BOOL_AND(met)         THEN '충족'
-              WHEN BOOL_OR(met IS FALSE) THEN '미충족'
-              ELSE '확인필요' END AS status,
+         -- [Phase1.1/D-18] 의미론 통일: 미해석 행(NULL)은 충족을 차단한다(item·cert·direct_prod 와 동일).
+         --   종전 BOOL_AND 은 NULL 을 건너뛰어 '미해석+통과 혼재'가 충족이 됐다.
+         CASE WHEN BOOL_OR(met IS FALSE) THEN '미충족'
+              WHEN BOOL_OR(met IS NULL)  THEN '확인필요'
+              ELSE '충족' END AS status,
          '인력 요건 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail,
          COALESCE(left(STRING_AGG(label, ', '), 300), '(미해석)')                      AS req_value,
          COALESCE(left(STRING_AGG(label, ', ') FILTER (WHERE met), 300), '(없음)')     AS act_value
@@ -457,9 +471,11 @@ perf_rows AS (
 ),
 ax_performance AS (
   SELECT bid_ntce_no, bid_ntce_ord, 'performance' AS axis, 'supp' AS class,
-         CASE WHEN BOOL_AND(met)         THEN '충족'
-              WHEN BOOL_OR(met IS FALSE) THEN '미충족'
-              ELSE '확인필요' END AS status,
+         -- [Phase1.1/D-18] 의미론 통일: 미해석 행(NULL)은 충족을 차단한다(item·cert·direct_prod 와 동일).
+         --   종전 BOOL_AND 은 NULL 을 건너뛰어 '미해석+통과 혼재'가 충족이 됐다.
+         CASE WHEN BOOL_OR(met IS FALSE) THEN '미충족'
+              WHEN BOOL_OR(met IS NULL)  THEN '확인필요'
+              ELSE '충족' END AS status,
          '실적 요건 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail,
          COALESCE(left(STRING_AGG(label, ', '), 300), '(미해석)')                      AS req_value,
          COALESCE(left(STRING_AGG(label, ', ') FILTER (WHERE met), 300), '(없음)')     AS act_value
@@ -498,9 +514,11 @@ cap_rows AS (
 ),
 ax_capacity AS (
   SELECT bid_ntce_no, bid_ntce_ord, 'capacity' AS axis, 'supp' AS class,
-         CASE WHEN BOOL_AND(met)         THEN '충족'
-              WHEN BOOL_OR(met IS FALSE) THEN '미충족'
-              ELSE '확인필요' END AS status,
+         -- [Phase1.1/D-18] 의미론 통일: 미해석 행(NULL)은 충족을 차단한다(item·cert·direct_prod 와 동일).
+         --   종전 BOOL_AND 은 NULL 을 건너뛰어 '미해석+통과 혼재'가 충족이 됐다.
+         CASE WHEN BOOL_OR(met IS FALSE) THEN '미충족'
+              WHEN BOOL_OR(met IS NULL)  THEN '확인필요'
+              ELSE '충족' END AS status,
          '시공능력 ' || COUNT(*) FILTER (WHERE met) || '/' || COUNT(*) AS detail,
          COALESCE(left(STRING_AGG(label, ', '), 300), '(미해석)')                      AS req_value,
          COALESCE(left(STRING_AGG(label, ', ') FILTER (WHERE met), 300), '(없음)')     AS act_value
