@@ -66,6 +66,18 @@ def _normalization_pipeline(knn_weight: float, bm25_weight: float) -> dict:
     }
 
 
+def _title_clause(text: str, boost: float) -> dict:
+    """type=title 청크(=공고명)에 대한 BM25 가점.
+    질의가 사업명과 겹치는 공고를 끌어올린다."""
+    return {
+        "bool": {
+            "must": [{"match": {"text": {"query": text}}}],
+            "filter": [{"term": {"type": "title"}}],
+            "boost": boost,
+        }
+    }
+
+
 def _build_query(
     *,
     text: str,
@@ -76,6 +88,7 @@ def _build_query(
     knn_weight: float,
     bm25_weight: float,
     knn_k: int,
+    title_boost: float = 0.0,
 ) -> dict:
     """벡터 + 키워드를 bool.should 로 병합한 OpenSearch 쿼리 본문을 만든다."""
     filters: list[dict] = []
@@ -104,8 +117,11 @@ def _build_query(
         }
     }
 
+    should = [knn_clause, bm25_clause]
+    if title_boost > 0:
+        should.append(_title_clause(text, title_boost))
     bool_query: dict = {
-        "should": [knn_clause, bm25_clause],
+        "should": should,
         "minimum_should_match": 1,
     }
     if filters:
@@ -128,6 +144,7 @@ def _build_hybrid_query(
     knn_weight: float,
     bm25_weight: float,
     knn_k: int,
+    title_boost: float = 0.0,
 ) -> dict:
     """정규화 하이브리드 쿼리 본문을 만든다.
 
@@ -149,8 +166,13 @@ def _build_hybrid_query(
     knn_clause = {"knn": {"vector": knn_inner}}
 
     match_clause: dict = {"match": {"text": {"query": text}}}
-    if filters:
-        bm25_clause: dict = {"bool": {"must": [match_clause], "filter": filters}}
+    title_should = [_title_clause(text, title_boost)] if title_boost > 0 else []
+    if filters or title_should:
+        bm25_clause: dict = {"bool": {
+            "must": [match_clause],
+            "should": title_should,
+            "filter": filters,
+        }}
     else:
         bm25_clause = match_clause
 
@@ -190,6 +212,7 @@ def _run_search(
     bm25_weight: float | None,
     normalize: bool | None = None,
     knn_multiplier: int | None = None,
+    title_boost: float | None = None,
 ) -> tuple[list[SearchHit], int]:
     """공통 검색 실행부. (검색 결과 리스트, 전체 매칭 수)를 반환한다.
 
@@ -201,6 +224,7 @@ def _run_search(
     bm25_weight = s.bm25_weight if bm25_weight is None else bm25_weight
     normalize = s.use_normalization if normalize is None else normalize
     mult = s.knn_candidate_multiplier if knn_multiplier is None else knn_multiplier
+    title_boost = s.title_boost if title_boost is None else title_boost
 
     vector = embed_query(query)
     builder = _build_hybrid_query if normalize else _build_query
@@ -213,6 +237,7 @@ def _run_search(
         knn_weight=knn_weight,
         bm25_weight=bm25_weight,
         knn_k=min(size * mult, _KNN_K_MAX),
+        title_boost=title_boost,
     )
     resp = get_client().search(index=s.opensearch_index, body=body)
 

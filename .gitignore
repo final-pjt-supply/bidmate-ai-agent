@@ -305,7 +305,17 @@ experiments/embedding/*_sweep_results.json
 # SDD 스크래치(로컬 전용)
 .superpowers/
 
+# ── 에이전트 평가 하네스 산출물 (재생성 가능한 실행 결과) ──
+eval_results/
+
 # Claude Code 하네스 산출물
 .claude/
+<<<<<<< HEAD
 .DS_Store
 master table/.DS_Store
+=======
+
+
+# testing
+for_test/
+>>>>>>> origin/main

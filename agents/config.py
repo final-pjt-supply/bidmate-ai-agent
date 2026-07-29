@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     # 관련 없는 질의에 억지로 결과를 만들어 보여주지 않기 위함이다.
     # "관련 공고를 찾지 못했습니다"가 무관한 공고를 보여주는 것보다 낫다.
     min_results: int = Field(0, alias="MIN_RESULTS")
+    # 공고명(title) 청크 가점. 질의가 사업명과 겹치는 공고를 끌어올린다.
+    # 0이면 미적용(기존 동작). BM25 쪽에만 얹어 벡터 점수는 불변.
+    title_boost: float = Field(1.0, alias="TITLE_BOOST")
 
     @property
     def pg_dsn(self) -> str:

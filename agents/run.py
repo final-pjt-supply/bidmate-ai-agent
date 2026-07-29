@@ -25,7 +25,7 @@ def _initial_state(req: AgentRequest) -> dict:
             "entry_context": req.entry_context,
             "session_context": req.session_context,
             "intent": None, "resolved_filters": None,
-            "eligibility": [], "chunks": [], "scores": [],
+            "eligibility": [], "chunks": [], "bid_names": {}, "scores": [],
             "answer": None, "citations": []}
 
 

@@ -20,6 +20,45 @@ logger = logging.getLogger(__name__)
 
 _PROMPT = (Path(__file__).parent.parent / "prompts" / "respond.md").read_text(
     encoding="utf-8")
+
+# 질의 성격별 지시(respond.md의 {task_block}에 끼운다).
+#
+# 한 벌의 프롬프트로 성격이 다른 질문을 전부 받으면 지시가 서로 희석된다 —
+# "공고 하나만 보고 답하라"와 "관련 없는 공고를 걸러내라"는 같은 턴에 둘 다
+# 참일 수 없다. 공통 규칙(그라운딩·출력 위생·슬롯 정의)은 respond.md에 한 번만
+# 두고, 이번 턴에 해당하는 지시만 골라 끼운다. 파일을 셋으로 쪼개지 않는 이유는
+# 절대 규칙이 3중으로 복제되면 반드시 한쪽만 고쳐져 어긋나기 때문이다.
+
+_TASK_DETAIL = """\
+지금 사용자는 특정 공고 하나를 보면서 묻고 있다.
+
+그 공고 한 건에만 집중해서 답하고, 신호에 다른 공고가 섞여 있어도 끌어오지 마라.
+질문이 짚은 항목(마감일·금액·자격 요건 등)을 headline에서 먼저 답하고,
+items에는 그렇게 답한 근거가 되는 원문 내용을 붙인다.
+
+신호에 그 항목이 없으면 없다고 말해라. 비슷해 보이는 다른 수치로 대신 채우면
+사용자가 그걸 답으로 믿는다."""
+
+_TASK_LIST = """\
+지금 사용자는 조건에 맞는 공고를 찾아달라고 했다.
+
+검색은 관련 없는 공고도 섞어서 돌려준다. 거르는 건 네 몫이다.
+<질의>에 나온 조건(지역·사업 종류·기관)에 맞지 않는 공고는 items에서 빼라.
+경기 지역을 물었는데 전북 공고가 신호에 들어와 있으면 그건 버린다.
+
+- headline에 건수를 적을 거면 items에 실제로 넣은 공고 수와 정확히 맞춰라.
+- 같은 공고를 두 번 넣지 마라.
+- 조건에 맞는 공고가 하나도 없으면 없다고 답하는 게 맞다. 억지로 채우지 마라."""
+
+_TASK_ELIGIBILITY = """\
+지금 사용자는 자격이 되는지를 묻고 있다.
+
+headline에서 판정 결과(가능 / 미달)를 먼저 분명히 말한다. 돌려 말하지 마라.
+미달이면 어느 항목이 왜 미달인지 신호에 적힌 사유를 필드 단위로 그대로 전달하고,
+보완하면 충족할 수 있는 항목이 있으면 그것도 알려준다.
+
+자격 판정과 낙찰 가능성은 다른 이야기다. 자격이 된다고 해서 낙찰을 예측하지 마라."""
+
 _NUM_RE = re.compile(r"\d+(?:[,.]\d+)*")
 _DATE_TOKEN_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$")
 
@@ -28,6 +67,7 @@ _DATE_TOKEN_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$")
 _MD_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")   # [t](u)·![t](u) → t
 _TAG_RE = re.compile(r"<[^>]+>")
 _URL_RE = re.compile(r"https?://\S+")
+_WS_RE = re.compile(r"\s+")
 
 
 class BidItem(BaseModel):
@@ -44,6 +84,12 @@ class RespondOutput(BaseModel):
     caveat: str | None
 
 
+def _squeeze(text: str) -> str:
+    """연속 공백을 하나로. bid_table의 공고명에는 원본 그대로 이중 공백이
+    들어있는 경우가 있어(예: "스쿨넷서비스  제공 용역") 표시 전에 정리한다."""
+    return _WS_RE.sub(" ", text).strip()
+
+
 def sanitize(text: str) -> str:
     """URL·HTML 태그·마크다운 링크 제거. 프롬프트로 막고(respond.md 절대 규칙)
     여기서 한 번 더 거른다 — 프롬프트는 확률, 이 함수는 보장."""
@@ -55,10 +101,28 @@ def sanitize(text: str) -> str:
     return cleaned.strip()
 
 
-def render_answer(out: RespondOutput) -> str:
-    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 목록 → 참고 순, 결정적."""
+def render_answer(out: RespondOutput,
+                  bid_names: dict[str, str] | None = None) -> str:
+    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 근거 → 참고 순, 결정적.
+
+    라벨은 공고명을 쓰고(bid_names에 있을 때), 없으면 bid_id로 폴백한다.
+    사용자에게 공고번호는 읽을 이유가 없는 식별자이고, 필요한 쪽(백엔드·프론트)은
+    citations에서 bid_id를 그대로 받는다.
+
+    같은 공고의 항목이 연달아 나오면 라벨을 반복하지 않고 들여쓴 줄로 잇는다 —
+    한 공고를 여러 문장으로 설명할 때 같은 이름이 매 줄 반복되는 것을 막는다.
+    """
+    names = bid_names or {}
     lines = [sanitize(out.headline)]
-    lines += [f"- {sanitize(i.bid_id)}: {sanitize(i.text)}" for i in out.items]
+    prev_label = None
+    for i in out.items:
+        label = sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+        text = sanitize(i.text)
+        if label == prev_label:
+            lines.append(f"  · {text}")
+        else:
+            lines.append(f"- {label}: {text}")
+            prev_label = label
     if out.caveat:
         lines.append(f"참고: {sanitize(out.caveat)}")
     return "\n".join(line for line in lines if line)
@@ -99,6 +163,28 @@ def _scores_block(state) -> str:
 def _chunks_block(state) -> str:
     return "\n".join(f"[{c.bid_id}#{c.chunk_idx}] {c.text}"
                      for c in state["chunks"]) or "(발췌 없음)"
+
+
+def _bids_block(state) -> str:
+    """bid_id → 공고명 대응표. 답변에서 공고를 공고명으로 지칭하기 위한 신호."""
+    names = state.get("bid_names") or {}
+    return "\n".join(f"- {bid}: {name}"
+                     for bid, name in sorted(names.items())) or "(공고명 정보 없음)"
+
+
+def _task_block(state: dict) -> str:
+    """이번 턴 질의의 성격에 맞는 지시를 고른다.
+
+    자격 판정이 신호에 있으면 그게 답의 중심이다. 그 다음은 스코프 폭으로
+    가른다 — bid_ids가 1건이면 사용자가 그 공고 하나를 보고 있는 것이고,
+    비어 있으면 검색 결과 여러 건을 훑는 상황이다.
+    """
+    intent = state.get("intent")
+    if (intent is not None and intent.type == "eligibility_only") \
+            or (state["eligibility"] and not state["chunks"]):
+        return _TASK_ELIGIBILITY
+    bid_ids = (state.get("resolved_filters") or {}).get("bid_ids") or []
+    return _TASK_DETAIL if len(bid_ids) == 1 else _TASK_LIST
 
 
 def check_grounding(answer: str, signals: str) -> list[str]:
@@ -147,9 +233,13 @@ def _fallback_answer(state) -> str:
 
 @node_logger("respond")
 def respond_node(state: dict) -> dict:
-    signals = "\n".join([_eligibility_block(state), _scores_block(state),
-                         _chunks_block(state)])
+    # bids_block(공고명)도 신호에 포함한다 — 공고명 속 숫자("2공구", "6호기" 등)가
+    # 답변에 인용될 때 grounding 검증에서 위반으로 오탐되지 않게 하기 위함.
+    signals = "\n".join([_bids_block(state), _eligibility_block(state),
+                         _scores_block(state), _chunks_block(state)])
     prompt = _PROMPT.format(
+        task_block=_task_block(state),
+        bids_block=_bids_block(state),
         eligibility_block=_eligibility_block(state),
         scores_block=_scores_block(state),
         chunks_block=_chunks_block(state),
@@ -162,7 +252,8 @@ def respond_node(state: dict) -> dict:
         raw = llm.invoke(ModelTier.SYNTHESIS, messages=messages,
                          max_tokens=1500,
                          output_schema=RespondOutput.model_json_schema())
-        candidate = render_answer(RespondOutput.model_validate(raw))
+        candidate = render_answer(RespondOutput.model_validate(raw),
+                                  state.get("bid_names"))
         violations = check_grounding(candidate, signals)
         if not violations:
             answer = candidate
