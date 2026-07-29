@@ -307,3 +307,5 @@ experiments/embedding/*_sweep_results.json
 
 # Claude Code 하네스 산출물
 .claude/
+.DS_Store
+master table/.DS_Store
