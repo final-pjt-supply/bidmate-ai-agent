@@ -245,6 +245,57 @@ def test_직생축은_supp이고_미등록은_미충족이다(rows):
     assert not 정책회귀, f"미등록인데 미충족이 아님 {len(정책회귀)}건: {정책회귀[:5]}"
 
 
+
+def test_인력_총원을_넘는_요구는_충족이_아니다():
+    """[D-19/v2.0] 헤드카운트 보존 불변식 — 초안 결함의 재발 방지.
+
+    분야 매칭(v2.0)의 관대 규칙(field_family NULL = 모든 계열 풀에 계상)이
+    총원 상한을 넘어 중복 계상되면 안 된다. 자격코드의 총 요구 인원이 회원의
+    총 보유 인원보다 큰 공고는 어떤 분야 배정으로도 충족이 불가능하다 —
+    그런데 인력 축이 '충족'이면 합산 보존 행(pers_qual_agg)이 빠진 회귀다.
+    v2.0 초안이 실제로 이 결함을 갖고 있었다(2026-07-29 발견·수정): NULL 인력이
+    계열 풀마다 중복 계상돼 1단계(v1.5)가 막은 공짜 통과가 되살아나는 구조였다.
+    등급형 자격은 상위 등급이 하위 요구를 채워 풀이 더 넓으므로 제외한다.
+    v1.5(합산)·v2.0(계열+합산) 모두에서 참이어야 하는 불변식이라 배포 전후 무관하다.
+    """
+    from agents.clients.postgres import get_cursor
+
+    sql = """
+        WITH req AS (            -- 요구측: (공고, 자격코드) 합산 — 분야 무시한 하한
+          SELECT bid_ntce_no, bid_ntce_ord, qual_code, SUM(headcount) AS need
+          FROM (SELECT DISTINCT bid_ntce_no, bid_ntce_ord, qual_code, qual_name,
+                                role_field, grade_raw, headcount, method
+                  FROM bid_require_personnel
+                 WHERE COALESCE(method,'') <> 'ignored') d
+          WHERE qual_code IS NOT NULL
+            AND qual_code NOT IN (SELECT qual_code FROM personnel_grade_master
+                                   WHERE qual_type = 'grade' AND grade_rank IS NOT NULL)
+          GROUP BY 1, 2, 3
+        ),
+        viol AS (                -- 총 보유 < 총 요구 = 어떤 분야 배정으로도 불가능
+          SELECT r.bid_ntce_no, r.bid_ntce_ord
+          FROM req r
+          LEFT JOIN (SELECT qual_code, SUM(headcount) AS have
+                       FROM company_personnel
+                      WHERE company_id = %s::bigint GROUP BY 1) h USING (qual_code)
+          GROUP BY 1, 2
+          HAVING BOOL_OR(COALESCE(h.have, 0) < r.need)
+        )
+        SELECT COUNT(*) AS n
+        FROM compute_match_results(%s::bigint) m
+        JOIN viol v ON v.bid_ntce_no = m.bid_ntce_no
+                   AND v.bid_ntce_ord = m.bid_ntce_ord,
+             LATERAL jsonb_array_elements(m.axes) ax
+        WHERE ax->>'axis' = 'personnel' AND ax->>'status' = '충족'
+    """
+    with get_cursor() as cur:
+        cur.execute(sql, [COMPANY_ID, COMPANY_ID])
+        n = cur.fetchone()["n"]
+    assert n == 0, (
+        f"총원 초과 요구인데 인력 축 '충족' {n}건 — 합산 보존(pers_qual_agg) 회귀"
+    )
+
+
 # ─────────────────────── 코드 vs SQL 대조 ───────────────────────
 
 def test_파이썬_건수가_SQL과_같다(rows):

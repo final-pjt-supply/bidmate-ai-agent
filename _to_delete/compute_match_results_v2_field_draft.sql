@@ -1,3 +1,10 @@
+-- ╔══════════════════════════════════════════════════════════════════════════╗
+-- ║ v2.0-field DRAFT — 배포 금지 (선행 조건 미충족 시)                        ║
+-- ║ 선행 조건: d19_stage2_ddl.sql 실행 (company_personnel.field_family 컬럼)  ║
+-- ║ 조건 충족 즉시 이 파일 전체 실행으로 배포 가능. 그 전까지 v1.5가 현행.   ║
+-- ║ 변경점: 인력 축이 분야(family) 단위 풀로 판정 — D-19 2~3단계 완성본.      ║
+-- ╚══════════════════════════════════════════════════════════════════════════╝
+
 -- ============================================================================
 -- BidMate 매칭 함수 — compute_match_results(company_id)  [RDS · DBeaver 1회 생성]
 --   2026-07-24. 02 엔진을 DB 함수로 감쌈. 매칭 로직의 단일 정본.
@@ -168,19 +175,6 @@
 --   분야 매칭(2~3단계, 회원 스키마 분야 차원)은 claude/d19_personnel_roadmap.md.
 --   [D-08 즉시분] '직접생산확인 요구(품목 미상)' 표시를 행동 지향 문구로 교체
 --   (원문 name_raw 는 불변 — 표시 치환만. 실측: 라이브 단독결정 51건/가능 후보 32건).
---
--- 2026-07-29(v2.0)  [D-19 2~3단계] 인력 축 분야 매칭. 선행: d19_stage2_ddl.sql
---   (company_personnel.field_family — 이 컬럼 없이는 함수 생성 자체가 실패한다).
---   · 요구측: role_field 원문(트리아지 880종)을 field_norm 15계열로 정규화,
---     풀 단위를 (공고, 자격코드) → (공고, 자격코드, 분야계열)로 세분.
---   · 회원측: field_family 동일 코드 체계(select 입력이라 정규화 불요). 매칭 규칙:
---     요구 계열 NULL → 전체 풀 / 회원 NULL → 분야 무관 인력으로 모든 계열 풀에 계상(관대).
---   · [헤드카운트 보존] pers_qual_agg — 분야 풀 2개 이상인 자격코드에 v1.5 합산 행
---     ('계 N명')을 유지한다. 관대 규칙만 두면 NULL 인력이 계열마다 중복 계상돼
---     1단계가 막은 공짜 통과(실측 194명분)가 배포 즉시 되살아난다(초안 결함 —
---     2026-07-29 밤 발견·수정). 이 행 덕에 전 회원 미입력(NULL) 동안 v2.0 판정 ≡ v1.5
---     가 보장되고(배포 무위험), 분야 입력이 쌓이면 계열 검사가 추가로 조여진다.
---   · 검증: d19_v2_verify.sql — 핵심은 ②(v1.5 캐시 대비 행 단위 완전 동등성 0건).
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -478,20 +472,6 @@ pers_pool AS (
   WHERE p.qual_code IS NOT NULL
   GROUP BY 1, 2, 3, 4
 ),
--- [v2.0/헤드카운트 보존] 분야 풀이 2개 이상인 자격코드의 '계 N명' 합산 행(v1.5 로직).
---   회원 NULL(분야 무관) 인력이 모든 계열 풀에 계상되는 관대 규칙의 견제 장치다:
---   계열별 검사는 "그 분야에 쓸 사람이 있나"를, 이 행은 "총원이 모자라진 않나"를 본다.
---   이 행이 없으면 조경1·소방1·토목1 요구를 NULL 1명이 세 풀에서 동시 충족한다
---   (= 1단계가 막은 공짜 통과 부활). 풀 1개짜리는 계열 행과 동일하므로 만들지 않는다.
-pers_qual_agg AS (
-  SELECT bid_ntce_no, bid_ntce_ord, qual_code,
-         MIN(qual_name)  AS qual_name,
-         SUM(headcount)  AS headcount,
-         left(STRING_AGG(DISTINCT NULLIF(fields_label,''), '·'), 60) AS fields_label
-  FROM pers_pool
-  GROUP BY 1, 2, 3
-  HAVING COUNT(*) > 1
-),
 pers_eval AS (
   -- ① 해석된 요구 — (공고, 자격코드, 분야계열) 풀 비교
   --   회원측 매칭 규칙: 요구 계열 NULL → 전체 풀 / 회원 field_family NULL(기존 데이터)
@@ -519,29 +499,6 @@ pers_eval AS (
     END AS met
   FROM pers_pool p
   LEFT JOIN personnel_grade_master m ON m.qual_code = p.qual_code
-  UNION ALL
-  -- ①b 합산 보존 행 — 계열 무시하고 자격코드 총 요구 vs 총 보유(분야 필터 없음).
-  --   전 회원 field_family NULL 인 동안 이 행이 v1.5 와 동일한 판정을 보장한다.
-  SELECT a.bid_ntce_no, a.bid_ntce_ord,
-    left(COALESCE(m.qual_name, a.qual_name, '인력')
-         || COALESCE('(' || NULLIF(a.fields_label, '') || ')', ''), 40)
-      || ' 계 ' || a.headcount || '명' AS label,
-    CASE
-      WHEN m.qual_type = 'grade' AND m.grade_rank IS NOT NULL THEN
-        (SELECT COALESCE(SUM(cp.headcount),0)
-           FROM company_personnel cp
-           JOIN personnel_grade_master gm ON gm.qual_code = cp.qual_code
-           CROSS JOIN params pa
-          WHERE cp.company_id = pa.company_id
-            AND gm.qual_type = 'grade' AND gm.field = m.field
-            AND gm.grade_rank >= m.grade_rank) >= a.headcount
-      ELSE
-        (SELECT COALESCE(SUM(cp.headcount),0)
-           FROM company_personnel cp CROSS JOIN params pa
-          WHERE cp.company_id = pa.company_id AND cp.qual_code = a.qual_code) >= a.headcount
-    END AS met
-  FROM pers_qual_agg a
-  LEFT JOIN personnel_grade_master m ON m.qual_code = a.qual_code
   UNION ALL
   -- ② 미해석 요구 — 종전 행 단위 (method='none' → 확인필요 / 그 외 → 총원 근사)
   SELECT r.bid_ntce_no, r.bid_ntce_ord,
