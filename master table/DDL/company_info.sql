@@ -105,12 +105,14 @@ CREATE INDEX IF NOT EXISTS idx_cce_company ON company_capacity_evals (company_id
 
 
 -- ═══════════════════════════════════════════════════════════
--- 매칭 결과 = bid↔company 유일 연결점 + "자격 N/M 충족"의 정본  (v2.5 · 게이트 3-state)
---   충족형 9축: 면허·지역·인력·품목(직생)·실적·인증·시공능력·규모·신용
---   required(M)=요구 있는 '참여 축'(게이트+보완) 수, satisfied(N)=충족 축 수 (N≤M). 인증(info)은 미참여.
---   verdict 판정 우선순위(정본): ① 게이트 확정 미충족 ≥1 → '불가'
---     ② 참여 축 확인필요 ≥1 → '확인필요'  ③ 보완 축 미충족 ≥1 → '보완가능'  ④ 그 외 → '가능'
---     하드게이트: 면허·지역·규모·직생 / 보완: 실적·인력·시공능력·신용·품목(비직생) / 표시: 인증(M2 강등)
+-- 매칭 결과 = bid↔company 유일 연결점 + "자격 N/M 충족"의 정본  (Phase3 2026-07-29 현행화)
+--   충족형 10축 — 게이트: 면허·지역·규모·품목(등록) / 보완: 인력·직생확인·실적·시공능력·인증·신용
+--   required(M)=참여 축(게이트+보완) 수, satisfied(N)=충족 축 수 (N≤M). info class 폐지
+--   (신용은 min_grade 파싱행만 축 생성 — 등급 미상·위양성은 축 미생성).
+--   verdict 판정 우선순위(정본): ⓪ 참여 축 0개 → '확인필요'(축0개 가드)
+--     ① 게이트 확정 미충족 ≥1 → '불가'  ② 참여 축 확인필요 ≥1 → '확인필요'
+--     ③ 보완 축 미충족 ≥1 → '보완가능'  ④ 그 외 → '가능'
+--   판정 원칙: 회원측 데이터 부재 → 미충족(책임 전가) / 공고측 미해석 → 확인필요
 --   gate_failed>0 ↔ '불가' (불가 사유 필터용). 지명경쟁·공동수급 배지는 bid_require_summary에서 직접 표시.
 -- ═══════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS match_results (
@@ -121,7 +123,7 @@ CREATE TABLE IF NOT EXISTS match_results (
   required SMALLINT NOT NULL CHECK (required >= 0),      -- 요구 있는 참여 축 수 (M)
   gate_failed SMALLINT NOT NULL DEFAULT 0,               -- 확정 미충족 게이트 축 수 (>0 ↔ 불가)
   need_review SMALLINT NOT NULL DEFAULT 0,               -- 확인필요 축 수 (게이트+보완)
-  axes JSONB NOT NULL,                            -- [{axis, class(gate|supp|info), status(충족|미충족|확인필요), detail}]
+  axes JSONB NOT NULL,                            -- [{axis, class(gate|supp), status(충족|미충족|확인필요), detail, required, actual}]
   normalizer_version VARCHAR(10),
   computed_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'Asia/Seoul'),
   PRIMARY KEY (company_id, bid_ntce_no, bid_ntce_ord),

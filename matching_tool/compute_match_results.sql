@@ -19,8 +19,8 @@
 --       ② agents/tools/bid_info.py 의 _OPEN_CONDITION
 --     반드시 같은 식으로 함께 유지할 것.
 --
--- 축 분류·판정 규칙은 02_match_engine_v1.sql과 100% 동일(정본). 여기선 params → 함수 인자,
---   대상 공고 → live_bids로 바뀐 것만 다름.
+-- 이 파일이 매칭 로직의 유일한 정본이다. (구 match_engine_v1.sql 은 2026-07-29 폐기 —
+--   Phase 1~3 미반영 스냅샷이었고, 로직 이중 정의가 드리프트의 원인이라 삭제. git 이력 참조.)
 -- ── 변경 이력 ──────────────────────────────────────────────
 -- 2026-07-27  [D3] axes 페이로드에 required·actual 분리 적재.
 --   10개 ax_* CTE 가 req_value·act_value 를 만들고 per_bid 가 JSON 키로 싣는다.
@@ -144,6 +144,22 @@
 --   [D-19 완화] 인력 라벨에 분야(role_field) 접두 — 분야별 요건의 반복 표시를 구분.
 --   평가의 분야 미반영(책임기술인 1명이 7개 분야 슬롯을 동시 충족 가능)은
 --   회원 스키마(company_personnel 분야 차원)+입력 UI 확장이 필요한 v2 = D-19.
+--
+-- 2026-07-29(Phase3)  [격상] cert·credit 을 판정에 편입, info class 삭제.
+--   근거(M1 실측, v1.9 재정규화 후): 인증 라이브 해석률 20.1% → 83.3%(미해석 171행) —
+--   확인필요 유입 부담이 작아져 격상 가능 판정.
+--   · ax_cert  : info → supp. 판정 의미는 종전 3-상태 그대로(회원 미보유 → 미충족 = 전가 정책,
+--                공고측 미해석 → 확인필요). '취득하면 가능' 문구가 보완가능 서사와 정합.
+--   · ax_credit: 전면 재설계(결정 3 — claude/final_milestone_2026-07-29.md).
+--       min_grade 가 파싱된 행만 supp 축을 생성한다(M1 실측 15건, 전부 'B').
+--       등급 미상(boolean-only) 요구와 credit_fp 위양성은 축 자체를 만들지 않는다 —
+--       3차 실측(배점표 혼입)의 재발 방지. 비교는 grade_scale 순위(회사채 AAA~D, 작을수록 우량).
+--       회원 등급 미등록 → 미충족(전가) / 회원 등급 형식 해석 불가 → 확인필요.
+--   · per_bid 의 class IN ('gate','supp') 필터는 방어용으로 유지(이제 전 축이 gate/supp).
+--   · [축0개] 분기의 ② 사례(info 축만 있는 공고)는 이 격상으로 소멸 — ①(행 없음)만 남는다.
+--   ★ 출력 형식(RETURNS TABLE·axes 키)은 불변 — 백엔드 계약 무영향. 단 axes 의 class 값에서
+--     'info' 가 사라지므로 프론트(참고 박스 렌더)에는 배포 전 필수 통보(M4).
+--   ★ 되돌리려면 ax_cert 의 class 리터럴 'supp'→'info', ax_credit 블록을 이력의 1.1 판으로 복원.
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -525,7 +541,7 @@ ax_capacity AS (
   FROM cap_rows GROUP BY 1,2
 ),
 
--- ═══════════════ ⑧ 신용 (info) — 배점 항목이라 판정 제외 ═══════════════
+-- ═══════════════ ⑧ 신용 (supp — Phase3 격상, min_grade 有 행만) ═══════════════
 -- credit_rating_req 근거 스니펫만 뽑는다. extraction_evidence 는 두 세대로 shape 가 다르다:
 --   구(백필) = [{page, field, snippet}, ...]        · 신(일일) = {field: [{page, snippet, ...}]}
 credit_ev AS (
@@ -550,31 +566,37 @@ credit_fp AS (
   GROUP BY 1,2
   HAVING BOOL_AND(snip ~ '(채무불이행|금융질서\s*문란|신용정보\s*관리규약)')
 ),
+-- [Phase3] 신용등급 순위표 — 회사채 계열(AAA~D, ± 수식). 작을수록 우량. CP(A1~) 체계는 v2.
+--   min_grade 는 어댑터 _GRADE_RE 가 이 집합의 부분집합만 생산하므로 JOIN 이 곧 유효성 필터다.
+grade_scale(g_txt, g_rank) AS (
+  VALUES ('AAA',1),('AA+',2),('AA',3),('AA-',4),('A+',5),('A',6),('A-',7),
+         ('BBB+',8),('BBB',9),('BBB-',10),('BB+',11),('BB',12),('BB-',13),
+         ('B+',14),('B',15),('B-',16),('CCC+',17),('CCC',18),('CCC-',19),
+         ('CC',20),('C',21),('D',22)
+),
 ax_credit AS (
-  -- [강등] 'supp' → 'info'. 신용평가등급은 참가자격이 아니라 적격심사 배점 항목이다.
-  --        info 는 required/satisfied 집계에서 빠진다(per_bid 참조). 상단 이력 참조.
-  SELECT c.bid_ntce_no, c.bid_ntce_ord, 'credit' AS axis, 'info' AS class,
-         CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '충족'   -- ← 가드: 위양성. 지우면 원복.
-              WHEN NOT c.required THEN '충족'
-              WHEN c.min_grade IS NOT NULL THEN '확인필요'   -- v1 도달 불가(min_grade 전건 NULL)
-              WHEN cq.credit_rating IS NOT NULL THEN '충족'
+  -- [Phase3/결정3] min_grade 파싱행만 supp 축 생성. 등급 미상(boolean-only)·credit_fp 위양성은
+  --   축 미생성 — 적격심사 배점표를 참가자격으로 오인한 건이 판정에 못 들어오게 하는 구조적 차단.
+  --   (JOIN grade_scale rr 이 min_grade IS NOT NULL + 유효 등급 필터를 겸한다)
+  SELECT c.bid_ntce_no, c.bid_ntce_ord, 'credit' AS axis, 'supp' AS class,
+         CASE WHEN cq.company_id IS NULL OR cq.credit_rating IS NULL THEN '미충족'  -- 회원측 부재(전가)
+              WHEN ar.g_rank IS NULL THEN '확인필요'          -- 회원 등급값 형식 해석 불가
+              WHEN ar.g_rank <= rr.g_rank THEN '충족'          -- 우량(순위 작음)할수록 충족
               ELSE '미충족' END AS status,
-         CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '신용등급 요구 아님 (결격사유 오인식 보정)'
-              WHEN c.min_grade IS NOT NULL THEN '요구등급 ' || c.min_grade || ' (v1 비교불가)'
-              WHEN cq.credit_rating IS NOT NULL THEN '신용평가 보유(' || cq.credit_rating || ')'
-              ELSE '신용평가 미보유' END AS detail,
-         CASE WHEN fp.bid_ntce_no IS NOT NULL THEN '(요구 없음)'
-              WHEN NOT c.required          THEN '(요구 없음)'
-              WHEN c.min_grade IS NOT NULL THEN c.min_grade
-              ELSE '신용평가등급 보유' END                                             AS req_value,
-         COALESCE(cq.credit_rating, '(미보유)')                                        AS act_value
+         '요구 ' || c.min_grade || ' 이상 · 우리 회사 '
+           || COALESCE(cq.credit_rating, '(미등록)') AS detail,
+         c.min_grade || ' 이상'                                                        AS req_value,
+         COALESCE(cq.credit_rating, '(미등록)')                                        AS act_value
   FROM bid_require_credit c
   JOIN live_bids lb ON lb.bid_ntce_no = c.bid_ntce_no AND lb.bid_ntce_ord = c.bid_ntce_ord
+  JOIN grade_scale rr ON rr.g_txt = c.min_grade
   LEFT JOIN credit_fp fp ON fp.bid_ntce_no = c.bid_ntce_no AND fp.bid_ntce_ord = c.bid_ntce_ord
   LEFT JOIN comp_qual cq ON TRUE
+  LEFT JOIN grade_scale ar ON ar.g_txt = upper(btrim(cq.credit_rating))
+  WHERE c.required AND fp.bid_ntce_no IS NULL
 ),
 
--- ═══════════════ ⑨ 인증 (info) ═══════════════
+-- ═══════════════ ⑨ 인증 (supp — Phase3 격상) ═══════════════
 cert_rows AS (
   SELECT r.bid_ntce_no, r.bid_ntce_ord,
          COUNT(*) AS n_req,
@@ -594,7 +616,9 @@ cert_rows AS (
   GROUP BY 1,2
 ),
 ax_cert AS (
-  SELECT bid_ntce_no, bid_ntce_ord, 'cert' AS axis, 'info' AS class,
+  -- [Phase3] info → supp. 판정 의미는 종전 그대로 — 회원 미보유 → 미충족(전가),
+  --   공고측 미해석(n_unres) → 확인필요. M1 실측 라이브 미해석 171행이라 유입 부담 소.
+  SELECT bid_ntce_no, bid_ntce_ord, 'cert' AS axis, 'supp' AS class,
          CASE WHEN n_ok = n_req           THEN '충족'
               WHEN n_ok + n_unres = n_req THEN '확인필요'
               ELSE '미충족' END AS status,

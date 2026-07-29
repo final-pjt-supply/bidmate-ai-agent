@@ -571,8 +571,11 @@ def write_bid(conn, no: str, ord_: str, rows: dict[str, list[dict]], dry_run: bo
 # ─────────────────────────────────────────────────────────────
 # 대상 선정 + 러너
 # ─────────────────────────────────────────────────────────────
-def select_targets(conn, current_version: str) -> list[dict]:
-    """정규화 필요 공고 = merged/partial 중 미정규화·재병합·버전상이."""
+def select_targets(conn, current_version: str, shard_count: int = 1, shard_idx: int = 0) -> list[dict]:
+    """정규화 필요 공고 = merged/partial 중 미정규화·재병합·버전상이.
+    [v1.9 병렬] shard_count > 1 이면 공고 키 해시로 파티션 — 워커 간 대상이 서로소라
+    같은 공고를 두 프로세스가 쓰는 일이 구조적으로 불가능하다(7-27 덮어쓰기 사고와 다른 조건).
+    hashtext 는 int4 라 abs 전에 bigint 캐스팅(INT_MIN abs 오버플로 방지)."""
     with conn.cursor(row_factory=_dict_row(conn)) as cur:
         cur.execute("""
             SELECT b.* FROM bid_table b
@@ -581,7 +584,8 @@ def select_targets(conn, current_version: str) -> list[dict]:
               AND (s.bid_ntce_no IS NULL
                    OR b.merged_at > s.normalized_at
                    OR s.normalizer_version <> %s)
-        """, (current_version,))
+              AND abs(hashtext(b.bid_ntce_no || '|' || b.bid_ntce_ord)::bigint) %% %s = %s
+        """, (current_version, shard_count, shard_idx))
         return cur.fetchall()
 
 def _dict_row(conn):
@@ -589,7 +593,8 @@ def _dict_row(conn):
     from psycopg.rows import dict_row
     return dict_row
 
-def run(conn, norm: Any, current_version: str = NORMALIZER_VERSION, dry_run: bool = True) -> dict:
+def run(conn, norm: Any, current_version: str = NORMALIZER_VERSION, dry_run: bool = True,
+        shard_count: int = 1, shard_idx: int = 0) -> dict:
     # autocommit: write_bid의 `with conn.transaction()`이 공고별 독립 트랜잭션으로 커밋되게 한다.
     #   (비autocommit이면 초기 SELECT가 연 트랜잭션 안에 전 공고가 savepoint로 묶여 = 한 방에 커밋/롤백,
     #    락도 끝까지 유지. autocommit이 공고 단위 커밋·재개가능·짧은 락을 보장.)
@@ -597,7 +602,7 @@ def run(conn, norm: Any, current_version: str = NORMALIZER_VERSION, dry_run: boo
         conn.autocommit = True
     mn  = MasterNames.load(conn, norm)
     ctx = build_lookup_context(conn, norm)         # normalizer.LookupContext (1회 구성)
-    targets = select_targets(conn, current_version)
+    targets = select_targets(conn, current_version, shard_count, shard_idx)
     log.info("대상 공고 %d건 (dry_run=%s)", len(targets), dry_run)
     n_bids = n_rows = 0
     failures: list = []
@@ -619,11 +624,36 @@ def run(conn, norm: Any, current_version: str = NORMALIZER_VERSION, dry_run: boo
     return {"bids": n_bids, "rows": n_rows, "failed": len(failures), "dry_run": dry_run}
 
 
+def _worker_main(dsn: str, dry_run: bool, shard_count: int, shard_idx: int):
+    """[v1.9 병렬] 워커 프로세스 본체. 커넥션·마스터 캐시를 프로세스마다 독립 구성.
+    macOS 는 spawn 방식이라 모듈이 재임포트됨 — 최상위 함수여야 한다."""
+    import psycopg
+    import normalizer
+    logging.basicConfig(level=logging.INFO, format=f"%(levelname)s [w{shard_idx}] %(message)s")
+    with psycopg.connect(dsn) as conn:
+        run(conn, normalizer, dry_run=dry_run, shard_count=shard_count, shard_idx=shard_idx)
+
+
 if __name__ == "__main__":
     import psycopg
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     import normalizer  # 실제 normalizer.py 주입
     dsn = os.environ["DB_DSN"]                     # key=value 전체 문자열
     dry = os.environ.get("DRY_RUN", "1") != "0"    # 기본 DRY_RUN
-    with psycopg.connect(dsn) as conn:
-        run(conn, normalizer, dry_run=dry)
+    workers = int(os.environ.get("WORKERS", "1"))  # [v1.9 병렬] 1 = 종전과 동일 동작
+    if workers <= 1:
+        with psycopg.connect(dsn) as conn:
+            run(conn, normalizer, dry_run=dry)
+    else:
+        # 병목이 공고당 DB 왕복(RDS 지연)이라 커넥션 분할로 거의 선형 가속.
+        # 파티션이 서로소라 동시 실행 안전 — 단, 람다 동시성 0 예약은 여전히 선행 조건.
+        import multiprocessing as mp
+        log.info("병렬 실행: %d 워커 (해시 파티션, dry_run=%s)", workers, dry)
+        procs = [mp.Process(target=_worker_main, args=(dsn, dry, workers, i), name=f"w{i}")
+                 for i in range(workers)]
+        for p in procs: p.start()
+        for p in procs: p.join()
+        bad = [p.name for p in procs if p.exitcode != 0]
+        if bad:
+            raise SystemExit(f"워커 비정상 종료: {bad} — 로그 확인 후 재실행(멱등이라 그대로 다시 돌리면 됨)")
+        log.info("전 워커 완료 (%d개) — 각 워커의 '완료: 공고 N건' 라인을 합산할 것", workers)
