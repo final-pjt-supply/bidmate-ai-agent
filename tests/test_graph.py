@@ -1,14 +1,26 @@
 from agents.graph import build_graph
-from agents.schemas import Filters, QueryIntent
+from agents.schemas import EntryContext
+from agents.state import BidBrief
 
 
-def _fake_router(intent_kw):
+def _fake_router(route):
     def node(state):
-        base = dict(type="full", action="answer", scope="new",
-                    entry_bid_scope="keep", new_filters=Filters(),
-                    normalized_query="q", clarify_message=None)
-        base.update(intent_kw)
-        return {"intent": QueryIntent(**base), "resolved_filters": {}}
+        return {"route": route}
+    return node
+
+
+def _fake_scope(bid_ids=None):
+    """scope는 공고 범위만 정한다. bid_ids=None이면 못 구한 상황."""
+    def node(state):
+        return {"resolved_filters": {"bid_ids": bid_ids} if bid_ids else {}}
+    return node
+
+
+def _fake_bid_search(bid_ids=("R_FOUND",)):
+    def node(state):
+        return {"resolved_filters": {"bid_ids": list(bid_ids)},
+                "bid_briefs": [BidBrief(bid_id=b, name=f"{b} 공고")
+                               for b in bid_ids]}
     return node
 
 
@@ -17,45 +29,67 @@ def _fake_respond(state):
 
 
 def _initial():
-    from agents.schemas import EntryContext
     return {"query": "q", "company_id": "c1",
             "entry_context": EntryContext(), "session_context": None,
-            "intent": None, "resolved_filters": None,
-            "eligibility": [], "chunks": [], "scores": [],
+            "route": None, "resolved_filters": None, "bid_briefs": [],
+            "eligibility": [], "chunks": [], "bid_names": {}, "scores": [],
             "answer": None, "citations": []}
 
 
-def _run(intent_kw):
-    graph = build_graph(_fake_router(intent_kw), _fake_respond)
+def _run(route, scope_bid_ids=None):
+    graph = build_graph(_fake_router(route), _fake_respond,
+                        scope_node=_fake_scope(scope_bid_ids),
+                        bid_search_node=_fake_bid_search())
     return graph.invoke(_initial())
 
 
-def test_full_path_runs_all_nodes():
-    out = _run({"type": "full"})
-    assert out["eligibility"] and out["chunks"] and out["scores"]
+def test_search_answers_from_bid_search_without_retrieval():
+    """검색 — 찾은 목록 자체가 답이다. 본문 발췌까지 가지 않는다."""
+    out = _run("검색")
+    assert out["bid_briefs"]
+    assert not out["chunks"]
+    assert not out["eligibility"]
     assert out["answer"] == "답변"
 
 
-def test_eligibility_only_skips_retrieval_and_scoring():
-    out = _run({"type": "eligibility_only"})
-    assert out["eligibility"]
-    assert not out["chunks"] and not out["scores"]
-    assert out["answer"] == "답변"
-
-
-def test_content_only_skips_eligibility():
-    out = _run({"type": "content_only"})
+def test_detail_with_scope_skips_bid_search():
+    out = _run("상세", scope_bid_ids=["R_ENTRY"])
+    assert out["resolved_filters"]["bid_ids"] == ["R_ENTRY"]
+    assert not out["bid_briefs"]              # bid_search를 안 탔다
     assert out["chunks"]
-    assert not out["eligibility"] and not out["scores"]
 
 
-def test_redirect_bypasses_everything():
-    out = _run({"action": "redirect"})
+def test_detail_without_scope_falls_through_bid_search():
+    out = _run("상세")
+    assert out["bid_briefs"]                  # bid_search가 공고를 찾았다
+    assert out["resolved_filters"]["bid_ids"] == ["R_FOUND"]
+    assert out["chunks"]                      # 그 범위에서 발췌까지 했다
+
+
+def test_eligibility_runs_with_scope():
+    out = _run("자격", scope_bid_ids=["R_POSSIBLE"])
+    assert out["eligibility"]
+    assert not out["chunks"]
+
+
+def test_eligibility_without_candidates_bypasses_node():
+    """'가능' 공고가 0건이면 판정 노드를 태우지 않는다.
+
+    빈 bid_ids를 넘기면 eligibility가 라이브 전건 판정으로 떨어진다.
+    """
+    out = _run("자격")
+    assert not out["eligibility"]
+    assert out["answer"] is None              # run.py가 결정적 문구로 답한다
+
+
+def test_other_bypasses_everything():
+    out = _run("기타")
     assert out["answer"] is None
     assert not out["eligibility"] and not out["chunks"]
+    assert not out["bid_briefs"]
 
 
-def test_clarify_bypasses_everything():
-    out = _run({"action": "clarify", "clarify_message": "어느 지역인가요?"})
-    assert out["answer"] is None
-    assert not out["eligibility"] and not out["chunks"]
+def test_scoring_is_never_wired():
+    """[3a] 스텁은 가짜 점수를 만든다 — 어느 경로도 이 노드를 타지 않는다."""
+    for route in ("검색", "상세", "자격", "기타"):
+        assert not _run(route, scope_bid_ids=["R1"])["scores"]
