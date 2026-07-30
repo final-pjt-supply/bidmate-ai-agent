@@ -247,7 +247,7 @@ def _run_search(
     except (OpenSearchException, ConnectionError, TimeoutError) as e:
         # 검색 실패(타임아웃/연결 등) 시 크래시 대신 빈 결과.
         # 응답 노드가 "검색 결과 없음"으로 안내하고 챗봇은 생존한다.
-        logging.getLogger("search").warning("검색 실패, 빈 결과 반환: %s", e)
+        logging.getLogger(__name__).warning("검색 실패, 빈 결과 반환: %s", e)
         return [], 0
 
     hits = resp.get("hits", {})
