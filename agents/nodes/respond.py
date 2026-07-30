@@ -57,7 +57,17 @@ headline에서 판정 결과(가능 / 미달)를 먼저 분명히 말한다. 돌
 미달이면 어느 항목이 왜 미달인지 신호에 적힌 사유를 필드 단위로 그대로 전달하고,
 보완하면 충족할 수 있는 항목이 있으면 그것도 알려준다.
 
-자격 판정과 낙찰 가능성은 다른 이야기다. 자격이 된다고 해서 낙찰을 예측하지 마라."""
+신호 머리줄에 "자격 '가능' 공고 N건 중 마감 임박 M건"이 있으면, **N을 먼저
+밝히고 지금 보여주는 것이 그중 M건임을 말한 뒤 더 볼지 물어라.** M건이 전부인
+것처럼 답하면 사용자는 낼 수 있는 공고를 놓친다.
+
+각 공고는 통과 여부만 되풀이하지 말고 신호에 있는 것을 말해라 — 마감일시,
+추정가격, 그리고 충족 축("면허, 실적, 신용")이나 충족 개수("7/9축").
+
+자격 판정과 낙찰 가능성은 다른 이야기다. 자격이 된다고 해서 낙찰을 예측하지 마라.
+이건 **하지 말라는 금지**이지, 매번 그 얘기를 덧붙이라는 뜻이 아니다.
+"낙찰 가능성은 별도로 검토가 필요합니다" 같은 면책 문구를 caveat에 적지 마라 —
+사용자가 묻지 않은 말이고, 판정 결과를 흐린다. 쓸 것이 없으면 caveat은 null이다."""
 
 _NUM_RE = re.compile(r"\d+(?:[,.]\d+)*")
 _DATE_TOKEN_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$")
@@ -138,18 +148,46 @@ _VERDICT_LABEL = {
 
 
 def _eligibility_block(state) -> str:
-    lines = []
-    for r in state["eligibility"]:
+    """자격 판정 신호.
+
+    판정 라벨만으로는 답변이 "통과입니다"를 되풀이할 수밖에 없다. 충족 축과
+    충족 개수(satisfied/required)를 함께 실어 "무엇을 확인해서 통과인지"를
+    말할 수 있게 한다 — 이 값들은 이미 state까지 와 있는데 지금까지 버려졌다.
+
+    전체 건수(eligible_total)도 머리줄에 싣는다. 대화에는 상위 몇 건만 실리므로,
+    이 수가 없으면 답변이 "이게 전부"인 것처럼 읽힌다.
+    """
+    results = state["eligibility"]
+    if not results:
+        return "(자격 판정 없음)"
+
+    # 남은 건수까지 적어준다. 답변이 "나머지 N건도 보시겠습니까?"로 이어지는 게
+    # 자연스러운데, N은 뺄셈이라 신호에 없으면 grounding 위반으로 잡혀 매 턴
+    # 재생성이 한 번씩 더 돈다(실측: 164-5=159가 위반으로 걸림).
+    total = state.get("eligible_total") or 0
+    shown = len(results)
+    lines = [f"자격 '가능' 공고 {total}건 중 마감 임박 {shown}건 "
+             f"(나머지 {total - shown}건)"
+             if total > shown else f"자격 판정 {shown}건"]
+
+    for r in results:
         label = _VERDICT_LABEL.get(r.verdict) if r.verdict else None
         if label is None:                       # verdict 없음(stub) → 기존 2분법
             label = "자격 통과" if r.passed else "자격 미달"
-        reasons = "; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
-                            for f in r.failed_reasons)
+        detail = []
+        if r.required_count:
+            detail.append(f"충족 {r.satisfied_count}/{r.required_count}축")
+        met = [a.axis for a in r.axes if a.status == "충족"]
+        if met:
+            detail.append("충족: " + ", ".join(met))
+        if r.failed_reasons:
+            detail.append("; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
+                                    for f in r.failed_reasons))
         line = f"- {r.bid_id}: {label}"
-        if reasons:
-            line += f" ({reasons})"
+        if detail:
+            line += f" ({' | '.join(detail)})"
         lines.append(line)
-    return "\n".join(lines) or "(자격 판정 없음)"
+    return "\n".join(lines)
 
 
 def _scores_block(state) -> str:
