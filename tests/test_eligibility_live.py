@@ -82,6 +82,33 @@ def rows():
     return result
 
 
+@pytest.fixture(scope="module")
+def 기대게이트_결측_ids():
+    """[D-23] 유형별 기대 게이트가 결측인 라이브 공고의 bid_id 집합.
+
+    물품(thng)인데 item 축 없음 / 용역·공사(servc·cnstwk)인데 license 축 없음.
+    유도 테스트와 D-23 핀 테스트가 공유한다. rows 와 같은 실행 시점의 스냅샷이
+    아니라 수 초 차이가 있을 수 있으나, 축 존재는 공고측 데이터라 안정적이다.
+    """
+    from agents.clients.postgres import get_cursor
+
+    sql = """
+        SELECT bt.bid_id
+        FROM compute_match_results(%s::bigint) n
+        JOIN bid_table bt
+          ON bt.bid_ntce_no = n.bid_ntce_no AND bt.bid_ntce_ord = n.bid_ntce_ord
+        LEFT JOIN LATERAL jsonb_array_elements(n.axes) ax ON TRUE
+        GROUP BY bt.bid_id, bt.bid_category
+        HAVING (bt.bid_category = 'thng'
+                AND NOT COALESCE(BOOL_OR(ax->>'axis' = 'item'), false))
+            OR (bt.bid_category IN ('servc', 'cnstwk')
+                AND NOT COALESCE(BOOL_OR(ax->>'axis' = 'license'), false))
+    """
+    with get_cursor() as cur:
+        cur.execute(sql, [COMPANY_ID])
+        return {row["bid_id"] for row in cur.fetchall()}
+
+
 # ─────────────────────────── 계약 ───────────────────────────
 
 def test_계약대로_값이_온다(rows):
@@ -180,7 +207,7 @@ def test_credit축은_등급요구가_있는_행만_생긴다(rows):
     assert not 회귀, f"등급 없는 credit 축 {len(회귀)}건: {회귀[:5]}"
 
 
-def test_verdict가_축목록에서_다시_유도된다(rows):
+def test_verdict가_축목록에서_다시_유도된다(rows, 기대게이트_결측_ids):
     """compute 의 CASE 를 파이썬에서 재현해 대조한다. [최대 구멍이었던 자리]
 
     분기 '순서'가 곧 우선순위다(required=0 → gate_failed → need_review →
@@ -199,6 +226,15 @@ def test_verdict가_축목록에서_다시_유도된다(rows):
             return "불가"
         if any(a.status == "확인필요" for a in 판정축):
             return "확인필요"
+        # [D-22] 게이트 축이 하나도 없는 공고의 supp 미충족은 보완가능이 아니라
+        #   확인필요다 — 게이트를 통과한 게 아니라 검증된 적이 없다(2026-07-30).
+        if (not any(a.axis_class == "gate" for a in 판정축)
+                and sum(1 for a in 판정축 if a.status == "충족") < len(판정축)):
+            return "확인필요"
+        # [D-23] 유형별 기대 게이트 결측 — 남은 낙관 경로(보완가능/가능)를 캡.
+        #   유형은 axes 로 유도 불가라 SQL 로 뽑은 집합(기대게이트_결측_ids)을 쓴다.
+        if r.bid_id in 기대게이트_결측_ids:
+            return "확인필요"
         if sum(1 for a in 판정축 if a.status == "충족") < len(판정축):
             return "보완가능"
         return "가능"
@@ -209,15 +245,23 @@ def test_verdict가_축목록에서_다시_유도된다(rows):
     )
 
 
-def test_보완가능과_확인필요에도_사유가_붙는다(rows):
+def test_보완가능과_확인필요에도_사유가_붙는다(rows, 기대게이트_결측_ids):
     """사유가 비면 화면이 회원에게 시킬 행동을 못 쓴다.
 
-    '확인필요' 는 두 갈래다 — 판정축 0개(분기1)와 need_review>0(분기3).
-    앞쪽은 사유가 없는 게 정상이라 required_count>0 일 때만 본다.
+    '확인필요' 는 이제 네 갈래다(2026-07-30 v2.3 기준) —
+      ① 판정축 0개(required=0)          : 사유 없음이 정상 → required_count>0 만 본다
+      ② need_review>0                   : 확인필요 축이 곧 사유
+      ③ 게이트0 + supp 미충족(D-22 캡)  : 미충족 축이 곧 사유
+      ④ 기대 게이트 결측(D-23 캡)       : 사유가 '미충족인 축'이 아니라 **없는 축**이라
+                                          failed_reasons 로 표현되지 않는다(축이 전부
+                                          충족일 수 있음) → 결측 집합으로 면제.
+    ④의 화면 문구는 프론트 몫 — "공고 유형상 확인돼야 할 요건이 공고에서
+    추출되지 않았습니다, 원문을 확인해 주세요" 계열(인수인계 참조).
     """
     빈사유 = [
         (r.bid_id, r.verdict) for r in rows
         if not r.failed_reasons
+        and r.bid_id not in 기대게이트_결측_ids
         and (r.verdict == "보완가능"
              or (r.verdict == "확인필요" and r.required_count > 0))
     ]
@@ -293,6 +337,41 @@ def test_인력_총원을_넘는_요구는_충족이_아니다():
         n = cur.fetchone()["n"]
     assert n == 0, (
         f"총원 초과 요구인데 인력 축 '충족' {n}건 — 합산 보존(pers_qual_agg) 회귀"
+    )
+
+
+
+def test_게이트없는_공고는_보완가능이_되지_않는다(rows):
+    """[D-22] '보완가능' 서사는 게이트 통과가 전제다.
+
+    실측(2026-07-30): 보완가능 25건 중 21건(84%)이 게이트 축 전무 — 물품 공고인데
+    품목 축조차 추출되지 않은, 게이트가 '검증된 적 없는' 공고였다. SW 회사에
+    아스콘 공고가 '보완하면 가능'으로 뜬 실사용 발견이 발단. 게이트 0개 + supp
+    미충족은 확인필요여야 한다. 이 가드가 빠지면 여기서 잡힌다.
+    """
+    위반 = [r.bid_id for r in rows
+            if r.verdict == "보완가능"
+            and not any(a.axis_class == "gate" for a in r.axes)]
+    assert not 위반, (
+        f"게이트 축 없는 '보완가능' {len(위반)}건: {위반[:5]} — D-22 가드 회귀"
+    )
+
+
+
+def test_기대게이트_결측이면_낙관판정이_없다(rows, 기대게이트_결측_ids):
+    """[D-23] 물품인데 품목 축 없음 / 용역·공사인데 면허 축 없음 → 가능·보완가능 금지.
+
+    발단(2026-07-30 실사용): SW 회사에 코팅기·크레인 구매 공고가 "규모 1/1 충족,
+    가능"으로 떴다 — 품목 검증 없이. 모집단 실측: 물품의 93.5%는 item 축이,
+    용역 92.7%·공사 79%는 license 축이 있다 — 결측은 요구가 없는 게 아니라
+    추출이 놓친 것이다. '가능' 목록의 결측 비율은 선택 효과로 부풀므로(게이트가
+    추출된 공고는 미보유 회사에겐 '불가'로 빠짐) 이 가드가 필요하다.
+    """
+    위반 = [(r.bid_id, r.verdict) for r in rows
+            if r.verdict in ("가능", "보완가능")
+            and r.bid_id in 기대게이트_결측_ids]
+    assert not 위반, (
+        f"기대 게이트 결측인데 낙관 판정 {len(위반)}건: {위반[:5]} — D-23 가드 회귀"
     )
 
 
