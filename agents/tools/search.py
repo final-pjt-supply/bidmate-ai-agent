@@ -15,6 +15,10 @@ A의 LangGraph가 tool로 감싸든, 배치가 직접 부르든 그대로 재사
 """
 from __future__ import annotations
 
+import logging
+
+from opensearchpy.exceptions import OpenSearchException
+
 from agents.clients.embedding import embed_query
 from agents.clients.opensearch import get_client
 from agents.config import get_settings
@@ -26,8 +30,6 @@ from agents.tools.search_types import (
     SearchHit,
     SearchResult,
 )
-from opensearchpy.exceptions import OpenSearchException
-import logging
 # knn 후보 폭의 기본 배수는 config(KNN_CANDIDATE_MULTIPLIER)에서 읽는다.
 # 정규화 하이브리드에서는 이 값이 중요하다: 후보가 적으면 knn 결과와 BM25 결과의
 # 겹침이 적어져, 한쪽에만 걸린 문서가 많아지고 점수가 0.5 부근에 몰린다.
