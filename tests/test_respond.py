@@ -198,3 +198,48 @@ def test_grounding_flags_partial_threshold():
 def test_grounding_flags_comma_inner_group():
     violations = check_grounding("낙찰 건수는 234건입니다", "추정가격 1,234,567원")
     assert "234" in violations
+
+
+def test_bids_block_carries_count_and_ordinals():
+    """건수·항목 번호가 신호에 실려야 답변의 "N건" 표현이 그라운딩된다.
+
+    _TASK_LIST가 건수를 적으라고 지시하는데 그 숫자가 신호에 없으면
+    check_grounding이 위반으로 잡아 재생성·폴백까지 떠밀린다(실측).
+    """
+    from agents.state import BidBrief
+    state = {"bid_briefs": [BidBrief(bid_id="R001_000", name="가 용역"),
+                            BidBrief(bid_id="R002_000", name="나 공사"),
+                            BidBrief(bid_id="R003_000", name="다 물품")],
+             "bid_names": {}}
+    signals = respond_mod._bids_block(state)
+    assert signals.startswith("공고 3건")
+    assert "1. R001_000" in signals and "3. R003_000" in signals
+    # 3건 중 1건만 골라 안내하는 답변도 위반이 아니어야 한다
+    assert check_grounding("조건에 맞는 공고는 3건 중 1건입니다", signals) == []
+
+
+def test_bids_block_falls_back_to_names_with_count():
+    state = {"bid_briefs": [], "bid_names": {"R001_000": "가 용역"}}
+    signals = respond_mod._bids_block(state)
+    assert signals.startswith("공고 1건")
+    assert "1. R001_000: 가 용역" in signals
+
+
+def test_bids_block_without_any_bid():
+    assert respond_mod._bids_block({"bid_briefs": [], "bid_names": {}}) \
+        == "(공고명 정보 없음)"
+
+
+def test_grounding_allows_zero_stripped_form():
+    """bid_table 마감일시는 "2026-07-30 10:00"로 실린다 — 신호 토큰이 "07"인데
+    답변은 "7월 30일"로 쓰는 것이 자연스럽다. 이걸 위반으로 잡으면 정상 답변이
+    재생성·폴백까지 떠밀린다(bid_search가 채우는 공고 요약이 이 형식이다)."""
+    signals = "- R001_000: 스쿨넷서비스 제공 용역 | 마감 2026-07-30 10:00"
+    assert check_grounding("마감은 2026년 7월 30일 10시입니다", signals) == []
+
+
+def test_grounding_zero_strip_does_not_widen_to_other_numbers():
+    """앞자리 0 제거가 무관한 수치까지 허용하면 안 된다."""
+    signals = "마감 2026-07-30 10:00"
+    violations = check_grounding("마감은 8월 3일입니다", signals)
+    assert "8" in violations and "3" in violations

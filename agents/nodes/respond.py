@@ -166,10 +166,39 @@ def _chunks_block(state) -> str:
 
 
 def _bids_block(state) -> str:
-    """bid_id → 공고명 대응표. 답변에서 공고를 공고명으로 지칭하기 위한 신호."""
+    """공고 목록 신호. 답변에서 공고를 공고명으로 지칭하기 위한 근거다.
+
+    bid_search가 찾은 요약(bid_briefs)이 있으면 그것을 쓴다 — `검색` 갈래는
+    문서 발췌 없이 이 목록만으로 답하므로, 마감일·금액·수요기관이 여기 실려야
+    답변에 나올 수 있다(값은 bid_table 원문이며 노드가 계산하지 않는다).
+    없으면 bid_id → 공고명 대응표로 폴백한다.
+
+    건수와 항목 번호를 함께 싣는다. _TASK_LIST가 "headline에 건수를 적을 거면
+    items 수와 맞춰라"라고 건수를 요구하는데, 그 숫자가 신호에 없으면
+    check_grounding이 위반으로 잡는다 — 지시가 요구하는 값을 검증기가 막는
+    모순이 된다(실측 2026-07-30: 위반 토큰 ['3','1'] 중 '1'이 건수였고 재생성
+    2회 실패로 폴백까지 갔다). 번호를 매기면 1..N이 신호 안의 사실이 되므로,
+    허용 집합을 넓히지 않고도 "3건 중 1건" 같은 표현이 그라운딩된다.
+    """
+    briefs = state.get("bid_briefs") or []
+    if briefs:
+        lines = [f"공고 {len(briefs)}건"]
+        for i, b in enumerate(briefs, start=1):
+            parts = [p for p in (b.institution, f"마감 {b.close_at}" if b.close_at
+                                 else "", f"추정가격 {b.price}" if b.price else "",
+                                 b.method) if p]
+            label = _squeeze(b.name) or b.bid_id
+            lines.append(f"{i}. {b.bid_id}: {label}"
+                         + (f" | {' | '.join(parts)}" if parts else ""))
+        return "\n".join(lines)
+
     names = state.get("bid_names") or {}
-    return "\n".join(f"- {bid}: {name}"
-                     for bid, name in sorted(names.items())) or "(공고명 정보 없음)"
+    if not names:
+        return "(공고명 정보 없음)"
+    lines = [f"공고 {len(names)}건"]
+    lines += [f"{i}. {bid}: {name}"
+              for i, (bid, name) in enumerate(sorted(names.items()), start=1)]
+    return "\n".join(lines)
 
 
 def _task_block(state: dict) -> str:
@@ -179,10 +208,11 @@ def _task_block(state: dict) -> str:
     가른다 — bid_ids가 1건이면 사용자가 그 공고 하나를 보고 있는 것이고,
     비어 있으면 검색 결과 여러 건을 훑는 상황이다.
     """
-    intent = state.get("intent")
-    if (intent is not None and intent.type == "eligibility_only") \
-            or (state["eligibility"] and not state["chunks"]):
+    route = state.get("route")
+    if route == "자격" or (state["eligibility"] and not state["chunks"]):
         return _TASK_ELIGIBILITY
+    if route == "검색":
+        return _TASK_LIST
     bid_ids = (state.get("resolved_filters") or {}).get("bid_ids") or []
     return _TASK_DETAIL if len(bid_ids) == 1 else _TASK_LIST
 
@@ -199,6 +229,10 @@ def check_grounding(answer: str, signals: str) -> list[str]:
     모든 토큰에 적용하면 "2.5배"의 "5"나 "87.745%"의 "87", "1,234,567"의
     "234" 같은 소수·금액 내부 자릿수가 무관한 답변 수치와 우연히 겹쳐
     그라운딩 검증을 무력화한다 — 날짜가 아닌 토큰은 분해하지 않는다.
+
+    앞자리 0을 뗀 형태도 허용한다. bid_table의 마감일시가 "2026-07-30 10:00"로
+    실려 신호 토큰이 "07"인데, 답변은 "7월 30일"로 쓰는 것이 자연스럽다. 이걸
+    위반으로 잡으면 정상 답변이 재생성·폴백까지 떠밀린다.
     """
     signal_tokens = _NUM_RE.findall(signals)
     allowed = set(signal_tokens)
@@ -206,6 +240,8 @@ def check_grounding(answer: str, signals: str) -> list[str]:
         allowed.add(tok.replace(",", ""))
         if _DATE_TOKEN_RE.match(tok):
             allowed.update(tok.split("."))
+        if tok.isdigit():
+            allowed.add(tok.lstrip("0") or "0")      # "07" → "7"
 
     violations = []
     for tok in _NUM_RE.findall(answer):
@@ -216,19 +252,33 @@ def check_grounding(answer: str, signals: str) -> list[str]:
 
 
 def build_summary(state) -> str:
-    """last_summary — 결정적 템플릿(LLM 안 씀)."""
+    """last_summary — 결정적 템플릿(LLM 안 씀).
+
+    bid_ids는 조건이 아니라 공고 스코프이므로 제외한다. scope·bid_search가 이
+    키를 항상 채우기 때문에, 안 빼면 모든 요약이 "조건: bid_ids"가 되어 다음 턴
+    라우터 프롬프트(last_summary)에 의미 없는 토큰이 실린다.
+    """
     bids = {r.bid_id for r in state["eligibility"]} | \
-           {c.bid_id for c in state["chunks"]}
-    keys = sorted((state.get("resolved_filters") or {}).keys())
+           {c.bid_id for c in state["chunks"]} | \
+           {b.bid_id for b in (state.get("bid_briefs") or [])}
+    keys = sorted(k for k in (state.get("resolved_filters") or {})
+                  if k != "bid_ids")
     return f"직전 턴: 공고 {len(bids)}건 안내 (조건: {', '.join(keys) or '없음'})"
 
 
 def _fallback_answer(state) -> str:
     """그라운딩 재생성까지 실패하면 생성문 대신 신호 원문만 안내한다.
-    발췌는 신호 그 자체라 정의상 그라운딩 위반이 불가능하다(안전 우선)."""
+    발췌는 신호 그 자체라 정의상 그라운딩 위반이 불가능하다(안전 우선).
+
+    `검색` 갈래는 청크를 만들지 않으므로 발췌만 보면 빈 껍데기가 나간다 —
+    그때는 공고 목록 신호를 그대로 안내한다.
+    """
     chunks = "\n".join(f"- {sanitize(c.text)}" for c in state["chunks"])
+    if chunks:
+        return ("답변 생성 중 확인되지 않은 수치가 반복 감지되어, 확인된 공고 "
+                "원문 발췌를 그대로 안내합니다.\n" + chunks)
     return ("답변 생성 중 확인되지 않은 수치가 반복 감지되어, 확인된 공고 "
-            "원문 발췌를 그대로 안내합니다.\n" + (chunks or "(발췌 없음)"))
+            "정보를 그대로 안내합니다.\n" + _bids_block(state))
 
 
 @node_logger("respond")

@@ -7,14 +7,39 @@ from agents.nodes.respond import build_summary, respond_node
 from agents.nodes.retrieval import retrieval_node
 from agents.nodes.router import router_node
 from agents.schemas import (AgentRequest, AgentResponse, Filters,
-                            PendingClarify, SessionContext)
+                            SessionContext)
 
 _MAX_BID_IDS = 20
+
+# route → 사용자에게 돌려줄 행동. 계약(AgentResponse.action)의 세 값 중 하나다.
+# redirect는 아직 어느 route도 내지 않는다 — '추천'(조건만 있는 질의 → 추천
+# 화면 이동) 라우트가 추가되면 그 매핑이 여기 들어온다.
+_ROUTE_ACTION: dict[str, str] = {
+    "검색": "answer",
+    "상세": "answer",
+    "자격": "answer",
+    "기타": "clarify",
+}
+
+# 아래 두 문구는 그래프가 노드를 타지 않고 빠진 경우다(graph.py). 답변 문자열이
+# 없는 상태이고, 신호 없이 LLM에 맡기면 없는 공고를 지어내므로 코드가 정한다.
+#
+# route=자격인데 '가능'한 공고가 없을 때.
+_NO_ELIGIBLE = "지금 자격 요건을 충족하는 공고가 없습니다."
+# 검색·상세인데 bid_search가 공고를 하나도 특정하지 못했을 때.
+_NOT_FOUND = ("질문에 해당하는 공고를 찾지 못했습니다. "
+              "공고명이나 조건을 조금 더 알려주시면 다시 찾아보겠습니다.")
+
+# 업무 밖 질의(route=기타)에 돌려줄 문구. LLM이 쓰게 하지 않고 코드가 고정한다 —
+# 질의를 통한 프롬프트 인젝션이 성공해도 이 경로로는 한 글자도 새 나갈 수 없다.
+OUT_OF_SCOPE = ("입찰 공고 검색과 공고 내용 안내를 도와드릴 수 있습니다. "
+                "찾으시는 공고나 조건을 알려주세요.")
 
 
 @lru_cache(maxsize=1)
 def _graph():
-    # retrieval(C)·eligibility(B) 실구현 배선. scoring(B)은 아직 stub 기본값.
+    # retrieval(C)·eligibility(B) 실구현 배선. scoring(B)은 배선하지 않는다
+    # (graph.build_graph 참조 — 스텁이 가짜 점수를 만든다).
     return build_graph(router_node, respond_node,
                        eligibility_node=eligibility_node,
                        retrieval_node=retrieval_node)
@@ -24,40 +49,35 @@ def _initial_state(req: AgentRequest) -> dict:
     return {"query": req.query, "company_id": req.company_id,
             "entry_context": req.entry_context,
             "session_context": req.session_context,
-            "intent": None, "resolved_filters": None,
+            "route": None, "resolved_filters": None, "bid_briefs": [],
             "eligibility": [], "chunks": [], "bid_names": {}, "scores": [],
             "answer": None, "citations": []}
 
 
-def _original_query(req: AgentRequest) -> str:
-    ctx = req.session_context
-    if ctx and ctx.pending:                 # 연속 clarify — 원 질의 유지
-        return ctx.pending.original_query
-    return req.query
-
-
 def run_agent(req: AgentRequest) -> AgentResponse:
     result = _graph().invoke(_initial_state(req))
-    intent = result["intent"]
+    action = _ROUTE_ACTION[result["route"]]
     resolved = Filters(**(result["resolved_filters"] or {}))
     # 스코프(bid_ids)는 필터가 아니다 — 컨텍스트로 저장 시 항상 뗀다.
     # 안 떼면 다음 턴 병합 베이스(prev)에 섞여 스코프 해제가 깨진다.
     storable = resolved.model_copy(update={"bid_ids": None})
 
-    if intent.action == "clarify":
+    if action == "clarify":
+        # route=기타 — 업무 밖 질의다. 되물은 것이 아니므로 pending을 만들지
+        # 않는다(만들면 다음 턴 라우터 컨텍스트에 "직전 턴에 되물었음. 원 질의:
+        # 점심 뭐 먹을까?"가 실려 분류를 흐린다). 직전 맥락은 그대로 통과시켜,
+        # 업무 밖 한 턴이 진행 중인 대화를 끊지 않게 한다.
         prev = req.session_context
         ctx = SessionContext(
             last_bid_ids=prev.last_bid_ids if prev else [],
-            last_summary="직전 턴: 조건을 되물음",
+            last_summary=prev.last_summary if prev else "직전 턴: 업무 밖 질의",
             last_filters=prev.last_filters if prev else Filters(),
-            pending=PendingClarify(original_query=_original_query(req),
-                                   partial_filters=storable),
+            pending=None,
         )
-        return AgentResponse(action="clarify",
-                             clarify_message=intent.clarify_message,
+        return AgentResponse(action="clarify", clarify_message=OUT_OF_SCOPE,
                              session_context=ctx)
 
-    if intent.action == "redirect":
+    if action == "redirect":
         prev = req.session_context
         ctx = SessionContext(
             last_bid_ids=prev.last_bid_ids if prev else [],
@@ -69,12 +89,23 @@ def run_agent(req: AgentRequest) -> AgentResponse:
                              session_context=ctx)
 
     # answer
+    #
+    # 이번 턴에 다룬 공고. bid_briefs를 빼면 `검색` 턴이 안내한 공고가 다음 턴에
+    # 승계되지 않는다 — 그 갈래는 청크도 판정도 만들지 않기 때문이다.
     bids = list(dict.fromkeys(
         [r.bid_id for r in result["eligibility"]] +
-        [c.bid_id for c in result["chunks"]]))[:_MAX_BID_IDS]
+        [c.bid_id for c in result["chunks"]] +
+        [b.bid_id for b in result["bid_briefs"]]))[:_MAX_BID_IDS]
 
-    if resolved.bid_ids and not bids:        # 승계했는데 전부 사라짐(stale)
-        answer = "이전에 보신 공고 중 조건에 맞는 것이 없습니다."
+    # "승계했는데 전부 사라짐(stale)" 분기는 없앴다. 판단 근거가 될 수 있는 것은
+    # "이번 턴이 직전 턴의 공고를 승계했다"인데, 지금 그런 승계가 없다(scope가
+    # 항상 새로 정한다). session_context.last_bid_ids로 대신 재면 "직전 턴이
+    # 공고를 안내했다"를 재는 것이라, 새 검색이 0건일 때 엉뚱하게 "이전에 보신
+    # 공고 중 …"이 나간다. 승계를 넣을 때 scope가 표시를 남기며 되살릴 자리다.
+    if result["route"] == "자격" and not result["eligibility"]:
+        answer = _NO_ELIGIBLE                # 판정 대상이 없어 노드를 안 탔다
+    elif result["answer"] is None:
+        answer = _NOT_FOUND                  # 공고를 특정하지 못해 노드를 안 탔다
     else:
         answer = result["answer"]
 
