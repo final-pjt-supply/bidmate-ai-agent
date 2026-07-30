@@ -57,7 +57,17 @@ headline에서 판정 결과(가능 / 미달)를 먼저 분명히 말한다. 돌
 미달이면 어느 항목이 왜 미달인지 신호에 적힌 사유를 필드 단위로 그대로 전달하고,
 보완하면 충족할 수 있는 항목이 있으면 그것도 알려준다.
 
-자격 판정과 낙찰 가능성은 다른 이야기다. 자격이 된다고 해서 낙찰을 예측하지 마라."""
+신호 머리줄에 "자격 '가능' 공고 N건 중 마감 임박 M건"이 있으면, **N을 먼저
+밝히고 지금 보여주는 것이 그중 M건임을 말한 뒤 더 볼지 물어라.** M건이 전부인
+것처럼 답하면 사용자는 낼 수 있는 공고를 놓친다.
+
+각 공고는 통과 여부만 되풀이하지 말고 신호에 있는 것을 말해라 — 마감일시,
+추정가격, 그리고 충족 축("면허, 실적, 신용")이나 충족 개수("7/9축").
+
+자격 판정과 낙찰 가능성은 다른 이야기다. 자격이 된다고 해서 낙찰을 예측하지 마라.
+이건 **하지 말라는 금지**이지, 매번 그 얘기를 덧붙이라는 뜻이 아니다.
+"낙찰 가능성은 별도로 검토가 필요합니다" 같은 면책 문구를 caveat에 적지 마라 —
+사용자가 묻지 않은 말이고, 판정 결과를 흐린다. 쓸 것이 없으면 caveat은 null이다."""
 
 _NUM_RE = re.compile(r"\d+(?:[,.]\d+)*")
 _DATE_TOKEN_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}$")
@@ -71,8 +81,15 @@ _WS_RE = re.compile(r"\s+")
 
 
 class BidItem(BaseModel):
-    """공고 1건 설명 슬롯 — respond 내부 전용(팀 계약 아님)."""
+    """답변 한 줄 슬롯 — respond 내부 전용(팀 계약 아님).
+
+    같은 bid_id로 여러 개를 쓰면 그 공고 아래 줄줄이 붙는다. 마감일·추정가격·
+    자격 축처럼 성격이 다른 정보를 한 줄에 몰아 쓰면 읽히지 않으므로, 항목을
+    나누고 각 줄에 이름(label)을 단다. 구분자와 들여쓰기는 render_answer가
+    붙이므로 LLM은 이름과 값만 정한다.
+    """
     bid_id: str
+    label: str          # "마감", "추정가격" 같은 항목 이름. 없으면 빈 문자열
     text: str
 
 
@@ -101,28 +118,61 @@ def sanitize(text: str) -> str:
     return cleaned.strip()
 
 
+# label로 쓰면 안 되는 이름. 공고 이름은 render_answer가 이미 윗줄에 쓰므로,
+# 이 이름을 단 항목은 같은 값을 한 번 더 적는 줄이 된다.
+_REDUNDANT_LABELS = {"공고명", "공고이름", "공고번호", "사업명", "공고", "bidid"}
+_LABEL_NOISE_RE = re.compile(r"[\s_·:]")
+
+
+def _is_redundant(item: "BidItem", bid_label: str) -> bool:
+    """윗줄의 공고 이름을 되풀이하는 항목인가.
+
+    프롬프트로 금지해도 label을 "공고명"으로 바꿔 우회하는 경우가 관측됐다.
+    프롬프트는 확률, 여기는 보장이다(ADR 0006 ③).
+    """
+    if _LABEL_NOISE_RE.sub("", item.label).lower() in _REDUNDANT_LABELS:
+        return True
+    return sanitize(_squeeze(item.text)) == bid_label
+
+
 def render_answer(out: RespondOutput,
                   bid_names: dict[str, str] | None = None) -> str:
-    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 근거 → 참고 순, 결정적.
+    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 항목 → 참고 순, 결정적.
 
-    라벨은 공고명을 쓰고(bid_names에 있을 때), 없으면 bid_id로 폴백한다.
-    사용자에게 공고번호는 읽을 이유가 없는 식별자이고, 필요한 쪽(백엔드·프론트)은
+    공고명은 한 줄을 차지하고 항목은 그 아래 들여쓴다. 한 공고에 마감일·
+    추정가격·충족 축이 함께 붙는데 한 줄로 이어 붙이면 읽히지 않는다.
+    같은 공고가 연달아 나오면 이름을 다시 쓰지 않는다.
+
+        결론 문장입니다.
+        - ○○ 도로시설개량공사-레미콘:
+          · 마감 : 2026-07-31 10:00
+          · 추정가격 : 250,873,091원
+        참고: …
+
+    공고 이름은 bid_names에 있으면 공고명, 없으면 bid_id로 폴백한다. 사용자에게
+    공고번호는 읽을 이유가 없는 식별자이고, 필요한 쪽(백엔드·프론트)은
     citations에서 bid_id를 그대로 받는다.
 
-    같은 공고의 항목이 연달아 나오면 라벨을 반복하지 않고 들여쓴 줄로 잇는다 —
-    한 공고를 여러 문장으로 설명할 때 같은 이름이 매 줄 반복되는 것을 막는다.
+    항목 이름은 LLM이 정하고 구분자(" : ")와 들여쓰기는 여기서 붙인다. 공고
+    이름을 되풀이하는 항목은 버린다(_is_redundant). 공고 머리줄은 살아남은
+    항목이 있을 때만 쓰므로, 전부 버려진 공고는 빈 껍데기로 남지 않는다.
     """
     names = bid_names or {}
     lines = [sanitize(out.headline)]
-    prev_label = None
+    prev_bid = None
     for i in out.items:
-        label = sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+        bid_label = sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+        if _is_redundant(i, bid_label):
+            logger.warning("render: 공고 이름을 되풀이하는 항목 제거 (label=%r)",
+                           i.label)
+            continue
+        if bid_label != prev_bid:
+            lines.append(f"- {bid_label}:")
+            prev_bid = bid_label
         text = sanitize(i.text)
-        if label == prev_label:
-            lines.append(f"  · {text}")
-        else:
-            lines.append(f"- {label}: {text}")
-            prev_label = label
+        item_label = sanitize(_squeeze(i.label))
+        lines.append(f"  · {item_label} : {text}" if item_label
+                     else f"  · {text}")
     if out.caveat:
         lines.append(f"참고: {sanitize(out.caveat)}")
     return "\n".join(line for line in lines if line)
@@ -138,18 +188,46 @@ _VERDICT_LABEL = {
 
 
 def _eligibility_block(state) -> str:
-    lines = []
-    for r in state["eligibility"]:
+    """자격 판정 신호.
+
+    판정 라벨만으로는 답변이 "통과입니다"를 되풀이할 수밖에 없다. 충족 축과
+    충족 개수(satisfied/required)를 함께 실어 "무엇을 확인해서 통과인지"를
+    말할 수 있게 한다 — 이 값들은 이미 state까지 와 있는데 지금까지 버려졌다.
+
+    전체 건수(eligible_total)도 머리줄에 싣는다. 대화에는 상위 몇 건만 실리므로,
+    이 수가 없으면 답변이 "이게 전부"인 것처럼 읽힌다.
+    """
+    results = state["eligibility"]
+    if not results:
+        return "(자격 판정 없음)"
+
+    # 남은 건수까지 적어준다. 답변이 "나머지 N건도 보시겠습니까?"로 이어지는 게
+    # 자연스러운데, N은 뺄셈이라 신호에 없으면 grounding 위반으로 잡혀 매 턴
+    # 재생성이 한 번씩 더 돈다(실측: 164-5=159가 위반으로 걸림).
+    total = state.get("eligible_total") or 0
+    shown = len(results)
+    lines = [f"자격 '가능' 공고 {total}건 중 마감 임박 {shown}건 "
+             f"(나머지 {total - shown}건)"
+             if total > shown else f"자격 판정 {shown}건"]
+
+    for r in results:
         label = _VERDICT_LABEL.get(r.verdict) if r.verdict else None
         if label is None:                       # verdict 없음(stub) → 기존 2분법
             label = "자격 통과" if r.passed else "자격 미달"
-        reasons = "; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
-                            for f in r.failed_reasons)
+        detail = []
+        if r.required_count:
+            detail.append(f"충족 {r.satisfied_count}/{r.required_count}축")
+        met = [a.axis for a in r.axes if a.status == "충족"]
+        if met:
+            detail.append("충족: " + ", ".join(met))
+        if r.failed_reasons:
+            detail.append("; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
+                                    for f in r.failed_reasons))
         line = f"- {r.bid_id}: {label}"
-        if reasons:
-            line += f" ({reasons})"
+        if detail:
+            line += f" ({' | '.join(detail)})"
         lines.append(line)
-    return "\n".join(lines) or "(자격 판정 없음)"
+    return "\n".join(lines)
 
 
 def _scores_block(state) -> str:

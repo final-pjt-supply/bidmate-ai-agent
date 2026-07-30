@@ -24,23 +24,29 @@ from __future__ import annotations
 _POSSIBLE = "가능"
 
 
-def possible_bids(company_id: str, *, limit: int) -> list[tuple[str, str]]:
+def possible_bids(company_id: str, *, limit: int) -> tuple[list[dict], int]:
     """자격이 '가능'한 마감 전 공고를 마감 임박 순으로 돌려준다.
 
-    공고명을 함께 SELECT한다. bid_table을 이미 JOIN하고 있어 비용이 0이고,
-    이것이 없으면 자격 답변이 공고를 `R26BK01606492_000`처럼 공고번호로
-    부르게 된다(respond.render_answer는 이름이 없으면 bid_id로 폴백한다).
+    공고명뿐 아니라 수요기관·마감일시·추정가격·계약방식을 함께 가져온다.
+    `bid_table`을 이미 JOIN하고 있어 컬럼을 더 SELECT하는 비용이 0이고, 이것이
+    없으면 자격 답변이 공고를 `R26BK01606492_000`처럼 공고번호로 부르거나
+    "세부 조건은 원문에서 확인하라"는 빈 말만 하게 된다.
+
+    전체 건수도 `COUNT(*) OVER ()`로 함께 센다. 윈도 함수는 LIMIT보다 먼저
+    계산되므로 자르기 **전** 건수가 나온다(회사 9001 기준 165건). 이 수가
+    없으면 답변이 "상위 5건이 전부"인 것처럼 읽힌다.
 
     Args:
         company_id: 회원 식별자(문자열). DB에선 BIGINT라 캐스팅한다.
-        limit: 최대 건수. 대화에 실을 분량이라 호출부가 정한다.
+        limit: 대화에 실을 최대 건수. 호출부가 정한다.
 
     Returns:
-        (bid_id, 공고명) 튜플 리스트. 마감이 이른 것부터. 없으면 빈 리스트.
-        공고명이 비어 있으면 빈 문자열.
+        (행 리스트, 전체 건수). 행은 마감이 이른 것부터. 없으면 ([], 0).
     """
     sql = """
-        SELECT bt.bid_id, bt.bid_ntce_nm
+        SELECT bt.bid_id, bt.bid_ntce_nm, bt.dminstt_nm, bt.ntce_instt_nm,
+               bt.bid_clse_dt, bt.presmpt_prce, bt.cntrct_cncls_mthd_nm,
+               COUNT(*) OVER () AS total
         FROM match_results m
         JOIN bid_table bt USING (bid_ntce_no, bid_ntce_ord)
         WHERE m.company_id = %s::bigint
@@ -54,5 +60,6 @@ def possible_bids(company_id: str, *, limit: int) -> list[tuple[str, str]]:
 
     with get_cursor() as cur:
         cur.execute(sql, (company_id, _POSSIBLE, limit))
-        return [(row["bid_id"], row["bid_ntce_nm"] or "")
-                for row in cur.fetchall()]
+        rows = cur.fetchall()
+
+    return rows, (rows[0]["total"] if rows else 0)

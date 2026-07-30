@@ -24,8 +24,13 @@ _ROUTE_ACTION: dict[str, str] = {
 # 아래 두 문구는 그래프가 노드를 타지 않고 빠진 경우다(graph.py). 답변 문자열이
 # 없는 상태이고, 신호 없이 LLM에 맡기면 없는 공고를 지어내므로 코드가 정한다.
 #
-# route=자격인데 '가능'한 공고가 없을 때.
+# route=자격인데 판정할 대상이 없을 때. 두 상황을 갈라야 한다 — 같은 문장을
+# 쓰면 "판정 데이터가 없다"가 "자격 미달"로 읽힌다.
+#   목록 질의   자격이 되는 공고가 실제로 하나도 없음
+#   특정 공고   그 공고의 판정이 없음(대개 마감돼 계산 대상에서 빠진 경우)
 _NO_ELIGIBLE = "지금 자격 요건을 충족하는 공고가 없습니다."
+_NO_VERDICT = ("이 공고의 자격 판정 정보를 찾지 못했습니다. "
+               "마감된 공고는 판정 대상에서 제외됩니다.")
 # 검색·상세인데 bid_search가 공고를 하나도 특정하지 못했을 때.
 _NOT_FOUND = ("질문에 해당하는 공고를 찾지 못했습니다. "
               "공고명이나 조건을 조금 더 알려주시면 다시 찾아보겠습니다.")
@@ -50,6 +55,7 @@ def _initial_state(req: AgentRequest) -> dict:
             "entry_context": req.entry_context,
             "session_context": req.session_context,
             "route": None, "resolved_filters": None, "bid_briefs": [],
+            "eligible_total": 0,
             "eligibility": [], "chunks": [], "bid_names": {}, "scores": [],
             "answer": None, "citations": []}
 
@@ -103,7 +109,9 @@ def run_agent(req: AgentRequest) -> AgentResponse:
     # 공고를 안내했다"를 재는 것이라, 새 검색이 0건일 때 엉뚱하게 "이전에 보신
     # 공고 중 …"이 나간다. 승계를 넣을 때 scope가 표시를 남기며 되살릴 자리다.
     if result["route"] == "자격" and not result["eligibility"]:
-        answer = _NO_ELIGIBLE                # 판정 대상이 없어 노드를 안 탔다
+        # 판정 대상이 없다. 진입 공고가 있었다면 "그 공고 판정을 못 구했다"이고,
+        # 없었다면 "자격 되는 공고가 없다"이다.
+        answer = _NO_VERDICT if req.entry_context.bid_id else _NO_ELIGIBLE
     elif result["answer"] is None:
         answer = _NOT_FOUND                  # 공고를 특정하지 못해 노드를 안 탔다
     else:

@@ -52,8 +52,12 @@ def _stub_bid_names(monkeypatch):
 def _stub_scope_db(monkeypatch):
     """scope의 match_results 조회(자격 갈래)가 실 PostgreSQL에 붙는 것을 막는다."""
     monkeypatch.setattr(scope_mod, "possible_bids",
-                        lambda company_id, *, limit: [("R26BK_POSSIBLE01",
-                                                      "가능 공고")])
+                        lambda company_id, *, limit: (
+                            [{"bid_id": "R26BK_POSSIBLE01",
+                              "bid_ntce_nm": "가능 공고",
+                              "dminstt_nm": "광주교육청", "ntce_instt_nm": None,
+                              "bid_clse_dt": None, "presmpt_prce": None,
+                              "cntrct_cncls_mthd_nm": None}], 165))
 
 
 def _rec(bid_id="R26BK_FOUND01", name="스쿨넷서비스 제공 용역"):
@@ -360,10 +364,24 @@ def test_eligibility_route_uses_possible_bids(monkeypatch):
 def test_eligibility_route_with_no_candidates_answers_deterministically(monkeypatch):
     """'가능' 0건 — 노드를 안 타므로 LLM 답변이 없다. 코드가 문구를 정한다."""
     monkeypatch.setattr(scope_mod, "possible_bids",
-                        lambda company_id, *, limit: [])
+                        lambda company_id, *, limit: ([], 0))
     _mock_llm(monkeypatch, route="자격")
     resp = run_agent(AgentRequest(query="나랑 맞는 공고 보여줘", company_id="9002",
                                   entry_context=EntryContext()))
     assert resp.action == "answer"
     assert resp.answer == run_mod._NO_ELIGIBLE
     assert resp.citations == []
+
+
+def test_missing_verdict_for_entry_bid_says_so(monkeypatch):
+    """특정 공고를 물었는데 판정이 없는 경우 — "자격 미달"로 읽히면 안 된다.
+
+    마감된 공고는 match_results 계산 대상에서 빠지므로 판정이 없다.
+    """
+    monkeypatch.setattr(eligibility_mod, "evaluate_eligibility",
+                        lambda company_id, bid_ids=None, **kw: [])
+    _mock_llm(monkeypatch, route="자격")
+    resp = run_agent(AgentRequest(query="우리 이 공고 자격 돼?", company_id="9001",
+                                  entry_context=EntryContext(bid_id="R_CLOSED")))
+    assert resp.answer == run_mod._NO_VERDICT
+    assert resp.answer != run_mod._NO_ELIGIBLE

@@ -48,15 +48,11 @@ def _brief(rec) -> BidBrief:
     info = rec.info
     if info is None:
         return BidBrief(bid_id=rec.hit.bid_id)
-    return BidBrief(
-        bid_id=info.bid_id,
-        name=info.bid_ntce_nm or "",
-        institution=info.dminstt_nm or info.ntce_instt_nm or "",
-        close_at=(info.bid_clse_dt.strftime("%Y-%m-%d %H:%M")
-                  if info.bid_clse_dt else ""),
-        price=(f"{info.presmpt_prce:,}원" if info.presmpt_prce else ""),
-        method=info.cntrct_cncls_mthd_nm or "",
-    )
+    return BidBrief.of(bid_id=info.bid_id, name=info.bid_ntce_nm,
+                       institution=info.dminstt_nm,
+                       fallback_institution=info.ntce_instt_nm,
+                       close_at=info.bid_clse_dt, price=info.presmpt_prce,
+                       method=info.cntrct_cncls_mthd_nm)
 
 
 @node_logger("bid_search")

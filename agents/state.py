@@ -25,6 +25,24 @@ class BidBrief(BaseModel):
     price: str = ""             # presmpt_prce — 표시용 문자열
     method: str = ""            # 계약 체결 방법(cntrct_cncls_mthd_nm)
 
+    @classmethod
+    def of(cls, *, bid_id: str, name=None, institution=None, fallback_institution=None,
+           close_at=None, price=None, method=None) -> "BidBrief":
+        """bid_table 원문 값을 표시 문자열로 옮긴다.
+
+        계산·가공은 하지 않는다 — 날짜는 형식만 바꾸고 금액은 천단위 구분만
+        넣는다(respond.md가 단위 변환·반올림을 금지한다). bid_search와 scope가
+        같은 형식을 내도록 여기 한 곳에 둔다.
+        """
+        return cls(
+            bid_id=bid_id,
+            name=name or "",
+            institution=institution or fallback_institution or "",
+            close_at=close_at.strftime("%Y-%m-%d %H:%M") if close_at else "",
+            price=f"{price:,}원" if price else "",
+            method=method or "",
+        )
+
 
 class AgentState(TypedDict):
     # 입력 (백엔드가 주입)
@@ -44,8 +62,12 @@ class AgentState(TypedDict):
     # [1] scope / [2] bid_search 산출 — 어느 공고를 볼지.
     #   resolved_filters["bid_ids"]가 뒤 노드의 작업 범위다.
     resolved_filters: dict | None
-    # bid_search가 찾은 공고 요약. `검색` 갈래에서 답변의 근거가 된다.
+    # bid_search·scope가 찾은 공고 요약. `검색`·`자격` 갈래에서 답변의 근거다.
     bid_briefs: list[BidBrief]
+    # `자격` 갈래에서 자격이 '가능'한 공고의 **전체** 건수. 대화에는 상위 몇 건만
+    # 싣기 때문에(scope의 _MAX_POSSIBLE), 이 수가 없으면 답변이 "5건이 전부"인
+    # 것처럼 읽힌다. 특정 공고 질의(entry_bid)에서는 0이다.
+    eligible_total: int
 
     # [3] B / [4] C 산출 (현재 스텁)
     eligibility: list[EligibilityResult]
