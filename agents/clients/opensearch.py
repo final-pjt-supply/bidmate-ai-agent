@@ -22,7 +22,7 @@ def get_client() -> OpenSearch:
         use_ssl=True,
         verify_certs=s.opensearch_verify_certs,
         ssl_show_warn=s.opensearch_verify_certs,
-        timeout=30,
-        max_retries=2,
-        retry_on_timeout=True,
+        timeout=10,
+        max_retries=1,
+        retry_on_timeout=False,
     )

@@ -15,6 +15,10 @@ A의 LangGraph가 tool로 감싸든, 배치가 직접 부르든 그대로 재사
 """
 from __future__ import annotations
 
+import logging
+
+from opensearchpy.exceptions import OpenSearchException
+
 from agents.clients.embedding import embed_query
 from agents.clients.opensearch import get_client
 from agents.config import get_settings
@@ -26,7 +30,6 @@ from agents.tools.search_types import (
     SearchHit,
     SearchResult,
 )
-
 # knn 후보 폭의 기본 배수는 config(KNN_CANDIDATE_MULTIPLIER)에서 읽는다.
 # 정규화 하이브리드에서는 이 값이 중요하다: 후보가 적으면 knn 결과와 BM25 결과의
 # 겹침이 적어져, 한쪽에만 걸린 문서가 많아지고 점수가 0.5 부근에 몰린다.
@@ -239,7 +242,13 @@ def _run_search(
         knn_k=min(size * mult, _KNN_K_MAX),
         title_boost=title_boost,
     )
-    resp = get_client().search(index=s.opensearch_index, body=body)
+    try:
+        resp = get_client().search(index=s.opensearch_index, body=body)
+    except (OpenSearchException, ConnectionError, TimeoutError) as e:
+        # 검색 실패(타임아웃/연결 등) 시 크래시 대신 빈 결과.
+        # 응답 노드가 "검색 결과 없음"으로 안내하고 챗봇은 생존한다.
+        logging.getLogger(__name__).warning("검색 실패, 빈 결과 반환: %s", e)
+        return [], 0
 
     hits = resp.get("hits", {})
     results = [_to_hit(h) for h in hits.get("hits", [])]
