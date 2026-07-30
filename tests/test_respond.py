@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 
 import agents.nodes.respond as respond_mod
 from agents.nodes.respond import (BidItem, RespondOutput, build_summary,
@@ -34,10 +34,11 @@ def _out(headline="여유율 2.5배로 자격을 충족합니다.", items=None, 
 
 def test_respond_builds_answer_and_citations(monkeypatch):
     monkeypatch.setattr(respond_mod.llm, "invoke", lambda *a, **k: _out(
-        items=[{"bid_id": "R26BK_STUB01", "text": "자격 통과, 여유율 2.5배"}]))
+        items=[{"bid_id": "R26BK_STUB01", "label": "", "text": "자격 통과, 여유율 2.5배"}]))
     out = respond_node(_state())
     assert out["answer"].splitlines()[0] == "여유율 2.5배로 자격을 충족합니다."
-    assert "- R26BK_STUB01: " in out["answer"]     # 렌더러 양식
+    # 렌더러 양식 — 공고 이름이 한 줄, 항목은 그 아래 들여쓴 줄
+    assert "- R26BK_STUB01:\n  · 자격 통과" in out["answer"]
     assert out["citations"]
     # 인용은 청크 원문 그대로
     assert all("입찰" in c.text or "낙찰" in c.text or "추정가격" in c.text
@@ -92,45 +93,89 @@ def test_grounding_violation_retry_succeeds(monkeypatch):
 # ---- 렌더러·sanitizer ----
 
 def test_render_answer_is_deterministic_format():
-    out = RespondOutput(headline="결론입니다.",
-                        items=[BidItem(bid_id="R001", text="설명 문장.")],
+    out = RespondOutput(headline="조건에 맞는 공고가 1건 있습니다.",
+                        items=[BidItem(bid_id="R001", label="", text="설명 문장.")],
                         caveat="지역 제한이 있습니다.")
     assert render_answer(out) == (
-        "결론입니다.\n- R001: 설명 문장.\n참고: 지역 제한이 있습니다.")
+        "조건에 맞는 공고가 1건 있습니다.\n- R001:\n  · 설명 문장.\n참고: 지역 제한이 있습니다.")
     assert render_answer(out) == render_answer(out)
+
+
+def test_render_answer_puts_item_label_before_value():
+    """항목 이름은 LLM이 정하고 구분자는 코드가 붙인다."""
+    out = RespondOutput(
+        headline="공고 1건입니다.",
+        items=[BidItem(bid_id="R001", label="마감", text="2026-07-31 10:00"),
+               BidItem(bid_id="R001", label="추정가격", text="250,873,091원"),
+               BidItem(bid_id="R001", label="", text="3개 축을 충족합니다.")],
+        caveat=None)
+    assert render_answer(out, {"R001": "레미콘 관급자재"}) == (
+        "공고 1건입니다.\n"
+        "- 레미콘 관급자재:\n"
+        "  · 마감 : 2026-07-31 10:00\n"
+        "  · 추정가격 : 250,873,091원\n"
+        "  · 3개 축을 충족합니다.")
+
+
+def test_render_answer_drops_items_that_repeat_the_bid_name():
+    """공고 이름은 머리줄에 이미 있다 — 되풀이하는 항목은 코드가 지운다.
+
+    프롬프트로 금지해도 label을 "공고명"으로 바꿔 우회하는 경우가 관측됐다.
+    """
+    out = RespondOutput(
+        headline="공고 1건입니다.",
+        items=[BidItem(bid_id="R001", label="공고명", text="레미콘 관급자재"),
+               BidItem(bid_id="R001", label="사업 명", text="아무 값"),
+               BidItem(bid_id="R001", label="", text="레미콘 관급자재"),
+               BidItem(bid_id="R001", label="마감", text="2026-07-31 10:00")],
+        caveat=None)
+    assert render_answer(out, {"R001": "레미콘 관급자재"}) == (
+        "공고 1건입니다.\n- 레미콘 관급자재:\n  · 마감 : 2026-07-31 10:00")
+
+
+def test_render_answer_omits_header_when_all_items_dropped():
+    """전부 버려진 공고는 빈 껍데기 머리줄만 남기지 않는다."""
+    out = RespondOutput(
+        headline="공고 1건입니다.",
+        items=[BidItem(bid_id="R001", label="공고명", text="레미콘 관급자재"),
+               BidItem(bid_id="R002", label="마감", text="2026-08-01 10:00")],
+        caveat=None)
+    assert render_answer(out, {"R001": "레미콘 관급자재", "R002": "다른 공고"}) == (
+        "공고 1건입니다.\n- 다른 공고:\n  · 마감 : 2026-08-01 10:00")
 
 
 def test_render_answer_labels_with_bid_name_when_available():
     """공고명을 알면 라벨로 쓴다 — 사용자에게 공고번호는 읽을 이유가 없다."""
-    out = RespondOutput(headline="결론입니다.",
-                        items=[BidItem(bid_id="R001", text="설명 문장.")],
+    out = RespondOutput(headline="조건에 맞는 공고가 1건 있습니다.",
+                        items=[BidItem(bid_id="R001", label="", text="설명 문장.")],
                         caveat=None)
     assert render_answer(out, {"R001": "○○청사  청소용역"}) == (
-        "결론입니다.\n- ○○청사 청소용역: 설명 문장.")   # 이중 공백도 정리
+        "조건에 맞는 공고가 1건 있습니다.\n- ○○청사 청소용역:\n  · 설명 문장.")   # 이중 공백도 정리
     # 맵에 없는 공고는 기존대로 bid_id (조회 실패·스텁 환경 폴백)
     assert render_answer(out, {"R999": "다른 공고"}) == (
-        "결론입니다.\n- R001: 설명 문장.")
+        "조건에 맞는 공고가 1건 있습니다.\n- R001:\n  · 설명 문장.")
 
 
 def test_render_answer_does_not_repeat_same_label():
-    """같은 공고를 여러 문장으로 설명해도 이름을 매 줄 반복하지 않는다."""
+    """같은 공고를 여러 줄로 설명해도 이름을 매 줄 반복하지 않는다."""
     out = RespondOutput(
-        headline="결론입니다.",
-        items=[BidItem(bid_id="R001", text="첫째 근거."),
-               BidItem(bid_id="R001", text="둘째 근거."),
-               BidItem(bid_id="R002", text="다른 공고 근거.")],
+        headline="조건에 맞는 공고가 1건 있습니다.",
+        items=[BidItem(bid_id="R001", label="", text="첫째 근거."),
+               BidItem(bid_id="R001", label="", text="둘째 근거."),
+               BidItem(bid_id="R002", label="", text="다른 공고 근거.")],
         caveat=None)
     assert render_answer(out, {"R001": "가공고", "R002": "나공고"}) == (
-        "결론입니다.\n- 가공고: 첫째 근거.\n  · 둘째 근거.\n- 나공고: 다른 공고 근거.")
+        "조건에 맞는 공고가 1건 있습니다.\n- 가공고:\n  · 첫째 근거.\n  · 둘째 근거."
+        "\n- 나공고:\n  · 다른 공고 근거.")
 
 
 def test_respond_uses_bid_names_from_state(monkeypatch):
     monkeypatch.setattr(respond_mod.llm, "invoke", lambda *a, **k: _out(
-        items=[{"bid_id": "R26BK_STUB01", "text": "자격 통과, 여유율 2.5배"}]))
+        items=[{"bid_id": "R26BK_STUB01", "label": "", "text": "자격 통과, 여유율 2.5배"}]))
     state = _state()
     state["bid_names"] = {"R26BK_STUB01": "전기공사 통합 발주"}
     out = respond_node(state)
-    assert "- 전기공사 통합 발주: " in out["answer"]
+    assert "- 전기공사 통합 발주:" in out["answer"]
     assert "R26BK_STUB01" not in out["answer"]      # 번호는 citations로만 나간다
 
 
@@ -146,7 +191,7 @@ def test_sanitize_strips_tags_links_urls():
 def test_answer_never_contains_html_or_links(monkeypatch):
     monkeypatch.setattr(respond_mod.llm, "invoke", lambda *a, **k: _out(
         headline='자격 충족 <img src=x onerror=alert(1)>',
-        items=[{"bid_id": "R26BK_STUB01",
+        items=[{"bid_id": "R26BK_STUB01", "label": "",
                 "text": "상세는 [여기](https://evil.com) 참고, 여유율 2.5배"}]))
     out = respond_node(_state())
     assert "<img" not in out["answer"]

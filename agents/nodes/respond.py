@@ -81,8 +81,15 @@ _WS_RE = re.compile(r"\s+")
 
 
 class BidItem(BaseModel):
-    """공고 1건 설명 슬롯 — respond 내부 전용(팀 계약 아님)."""
+    """답변 한 줄 슬롯 — respond 내부 전용(팀 계약 아님).
+
+    같은 bid_id로 여러 개를 쓰면 그 공고 아래 줄줄이 붙는다. 마감일·추정가격·
+    자격 축처럼 성격이 다른 정보를 한 줄에 몰아 쓰면 읽히지 않으므로, 항목을
+    나누고 각 줄에 이름(label)을 단다. 구분자와 들여쓰기는 render_answer가
+    붙이므로 LLM은 이름과 값만 정한다.
+    """
     bid_id: str
+    label: str          # "마감", "추정가격" 같은 항목 이름. 없으면 빈 문자열
     text: str
 
 
@@ -111,28 +118,61 @@ def sanitize(text: str) -> str:
     return cleaned.strip()
 
 
+# label로 쓰면 안 되는 이름. 공고 이름은 render_answer가 이미 윗줄에 쓰므로,
+# 이 이름을 단 항목은 같은 값을 한 번 더 적는 줄이 된다.
+_REDUNDANT_LABELS = {"공고명", "공고이름", "공고번호", "사업명", "공고", "bidid"}
+_LABEL_NOISE_RE = re.compile(r"[\s_·:]")
+
+
+def _is_redundant(item: "BidItem", bid_label: str) -> bool:
+    """윗줄의 공고 이름을 되풀이하는 항목인가.
+
+    프롬프트로 금지해도 label을 "공고명"으로 바꿔 우회하는 경우가 관측됐다.
+    프롬프트는 확률, 여기는 보장이다(ADR 0006 ③).
+    """
+    if _LABEL_NOISE_RE.sub("", item.label).lower() in _REDUNDANT_LABELS:
+        return True
+    return sanitize(_squeeze(item.text)) == bid_label
+
+
 def render_answer(out: RespondOutput,
                   bid_names: dict[str, str] | None = None) -> str:
-    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 근거 → 참고 순, 결정적.
+    """양식은 코드가 소유한다 — 한 줄 결론 → 공고별 항목 → 참고 순, 결정적.
 
-    라벨은 공고명을 쓰고(bid_names에 있을 때), 없으면 bid_id로 폴백한다.
-    사용자에게 공고번호는 읽을 이유가 없는 식별자이고, 필요한 쪽(백엔드·프론트)은
+    공고명은 한 줄을 차지하고 항목은 그 아래 들여쓴다. 한 공고에 마감일·
+    추정가격·충족 축이 함께 붙는데 한 줄로 이어 붙이면 읽히지 않는다.
+    같은 공고가 연달아 나오면 이름을 다시 쓰지 않는다.
+
+        결론 문장입니다.
+        - ○○ 도로시설개량공사-레미콘:
+          · 마감 : 2026-07-31 10:00
+          · 추정가격 : 250,873,091원
+        참고: …
+
+    공고 이름은 bid_names에 있으면 공고명, 없으면 bid_id로 폴백한다. 사용자에게
+    공고번호는 읽을 이유가 없는 식별자이고, 필요한 쪽(백엔드·프론트)은
     citations에서 bid_id를 그대로 받는다.
 
-    같은 공고의 항목이 연달아 나오면 라벨을 반복하지 않고 들여쓴 줄로 잇는다 —
-    한 공고를 여러 문장으로 설명할 때 같은 이름이 매 줄 반복되는 것을 막는다.
+    항목 이름은 LLM이 정하고 구분자(" : ")와 들여쓰기는 여기서 붙인다. 공고
+    이름을 되풀이하는 항목은 버린다(_is_redundant). 공고 머리줄은 살아남은
+    항목이 있을 때만 쓰므로, 전부 버려진 공고는 빈 껍데기로 남지 않는다.
     """
     names = bid_names or {}
     lines = [sanitize(out.headline)]
-    prev_label = None
+    prev_bid = None
     for i in out.items:
-        label = sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+        bid_label = sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+        if _is_redundant(i, bid_label):
+            logger.warning("render: 공고 이름을 되풀이하는 항목 제거 (label=%r)",
+                           i.label)
+            continue
+        if bid_label != prev_bid:
+            lines.append(f"- {bid_label}:")
+            prev_bid = bid_label
         text = sanitize(i.text)
-        if label == prev_label:
-            lines.append(f"  · {text}")
-        else:
-            lines.append(f"- {label}: {text}")
-            prev_label = label
+        item_label = sanitize(_squeeze(i.label))
+        lines.append(f"  · {item_label} : {text}" if item_label
+                     else f"  · {text}")
     if out.caveat:
         lines.append(f"참고: {sanitize(out.caveat)}")
     return "\n".join(line for line in lines if line)
