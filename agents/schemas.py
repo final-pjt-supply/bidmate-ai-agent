@@ -35,7 +35,13 @@ class PendingClarify(BaseModel):
 
 class SessionContext(BaseModel):
     last_bid_ids: list[str]                # 상한 20건 — run.py에서 절단
-    last_summary: str
+    last_summary: str                      # 직전 1턴 — router가 읽는다
+    # 최근 턴 요약 기록. 오래된 → 최신 순, 상한 10건(run.py에서 절단).
+    # rewrite가 "아까 그 공고"를 풀 근거다. recent_turns[-1] == last_summary로
+    # 중복되지만 소비자의 요구가 다르다 — router는 직전 한 줄, rewrite는 흐름
+    # 전체. 대화 원문이 아니라 결정적 템플릿 요약만 쌓으므로 2차 인젝션 경로가
+    # 되지 않는다(ADR 0006·0008).
+    recent_turns: list[str] = []
     last_filters: Filters
     pending: PendingClarify | None = None
 

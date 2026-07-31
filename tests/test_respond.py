@@ -218,6 +218,41 @@ def test_build_summary_is_deterministic():
     assert "1건" in build_summary(s) or "건" in build_summary(s)
 
 
+# ---- build_summary 골든 ----
+#
+# 출력 전문을 고정한다. rewrite·router 프롬프트가 이 형식에 의존하는데, 지금까지
+# 어떤 테스트도 형식을 지키지 않았다 — 통째로 바꿔도 전부 통과했다(2026-07-31).
+# 형식을 바꿀 일이 생기면 여기가 먼저 깨져야 한다. 깨지면 rewrite.md 예시와
+# router.py의 접두사도 함께 봐야 한다는 신호다.
+
+def test_build_summary_golden_no_route_no_names():
+    """route도 공고명도 없을 때 — label은 '공고'로 폴백한다."""
+    assert build_summary(_state()) == "공고 2건 안내 (조건: region)"
+
+
+def test_build_summary_golden_detail_with_names():
+    """공고명이 있으면 최대 _SUMMARY_NAMES(3)건까지 싣고 나머지는 '외 N건'."""
+    s = _state()
+    s["route"] = "상세"
+    s["bid_names"] = {"R26BK_STUB01": "국가기상슈퍼컴퓨터 교체(6호기 구축)"}
+    assert build_summary(s) == (
+        "상세 2건 안내 — 국가기상슈퍼컴퓨터 교체(6호기 구축) 외 1건 (조건: region)")
+
+
+def test_build_summary_golden_search_from_briefs():
+    """`검색` 갈래는 청크도 판정도 없다 — bid_briefs에서 공고가 와야 한다."""
+    from agents.state import BidBrief
+    s = {"eligibility": [], "chunks": [], "route": "검색",
+         "bid_briefs": [BidBrief(bid_id="R001_000", name="대전 하수관로 정비공사"),
+                        BidBrief(bid_id="R002_000",
+                                 name="대전 학교 전기설비 개선공사")],
+         "bid_names": {"R001_000": "대전 하수관로 정비공사",
+                       "R002_000": "대전 학교 전기설비 개선공사"},
+         "resolved_filters": {"bid_ids": ["R001_000", "R002_000"]}}
+    assert build_summary(s) == (
+        "검색 2건 안내 — 대전 하수관로 정비공사, 대전 학교 전기설비 개선공사")
+
+
 def test_grounding_allows_date_and_comma_number_parts():
     signals = "마감일 2026.08.01, 추정가격 1,200,000,000원"
     answer = "08월 01일 마감이며 추정가격은 1200000000원입니다"

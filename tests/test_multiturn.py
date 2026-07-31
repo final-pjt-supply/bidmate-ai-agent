@@ -208,7 +208,14 @@ def _mock_llm(monkeypatch, route="상세", respond_payload=None):
 
     def fake_invoke(tier, messages, system=None, max_tokens=1024,
                     output_schema=None):
-        return {"route": route} if tier == ModelTier.ROUTER else respond_payload
+        # rewrite도 ROUTER 티어를 쓰므로 티어만으로는 못 가른다 — 요구된
+        # 스키마로 가른다.
+        props = (output_schema or {}).get("properties", {})
+        if "route" in props:
+            return {"route": route}
+        if "query" in props:
+            return {"query": messages[0]["content"][:0] or "재구성된 질의"}
+        return respond_payload
     monkeypatch.setattr(router_mod.llm, "invoke", fake_invoke)
 
 
@@ -371,6 +378,107 @@ def test_eligibility_route_with_no_candidates_answers_deterministically(monkeypa
     assert resp.action == "answer"
     assert resp.answer == run_mod._NO_ELIGIBLE
     assert resp.citations == []
+
+
+# ---- recent_turns 누적 ----
+
+def _sc(recent, *, bid_ids=None, summary=None):
+    """recent_turns를 가진 SessionContext. summary 기본값은 불변식을 지킨다."""
+    return SessionContext(
+        last_bid_ids=bid_ids if bid_ids is not None else ["R001"],
+        last_summary=summary if summary is not None else (
+            recent[-1] if recent else ""),
+        last_filters=Filters(), recent_turns=recent)
+
+
+def test_push_turn_appends_in_order():
+    from agents.run import _push_turn
+    assert _push_turn(None, "A") == ["A"]
+    assert _push_turn(_sc(["A"]), "B") == ["A", "B"]
+    assert _push_turn(_sc(["A", "B"]), "C") == ["A", "B", "C"]
+
+
+def test_push_turn_caps_at_max_dropping_oldest():
+    from agents.run import _MAX_RECENT_TURNS, _push_turn
+    assert _MAX_RECENT_TURNS == 10
+    history = _push_turn(None, "턴0")
+    for i in range(1, 12):
+        history = _push_turn(_sc(history), f"턴{i}")
+    assert len(history) == 10
+    assert history[0] == "턴2"          # 턴0·턴1이 밀려났다
+    assert history[-1] == "턴11"
+
+
+def test_answer_turn_records_summary(monkeypatch):
+    _mock_llm(monkeypatch)
+    resp = run_agent(AgentRequest(query="대전 공고", company_id="c1",
+                                  entry_context=EntryContext()))
+    ctx = resp.session_context
+    assert len(ctx.recent_turns) == 1
+    assert ctx.recent_turns[-1] == ctx.last_summary        # 불변식
+
+
+def test_out_of_scope_turn_does_not_record(monkeypatch):
+    """기타 턴은 기록을 남기지 않고 통과시킨다 — 업무 밖 한 턴이 진행 중인
+    대화를 끊지 않게 한다(run.py clarify 분기의 기존 의도를 그대로 확장)."""
+    _mock_llm(monkeypatch, route="기타")
+    prev = _sc(["상세 1건 안내 — 가"])
+    resp = run_agent(AgentRequest(query="점심 뭐 먹을까?", company_id="c1",
+                                  entry_context=EntryContext(),
+                                  session_context=prev))
+    assert resp.session_context.recent_turns == ["상세 1건 안내 — 가"]
+    assert resp.session_context.last_summary == "상세 1건 안내 — 가"
+
+
+def test_invariant_holds_across_out_of_scope_turn(monkeypatch):
+    """기타 턴이 중간에 껴도 recent_turns[-1] == last_summary가 유지된다.
+
+    두 값이 같은 분기에서 함께 움직이기 때문이다 — 기타 경로는 둘 다 이전 값을
+    통과시킨다(덮어쓰지 않는다).
+    """
+    _mock_llm(monkeypatch)
+    c1 = run_agent(AgentRequest(query="대전 공고", company_id="c1",
+                                entry_context=EntryContext())).session_context
+    assert c1.recent_turns[-1] == c1.last_summary
+
+    _mock_llm(monkeypatch, route="기타")
+    c2 = run_agent(AgentRequest(query="점심 뭐 먹을까?", company_id="c1",
+                                entry_context=EntryContext(),
+                                session_context=c1)).session_context
+    assert c2.recent_turns[-1] == c2.last_summary
+
+    _mock_llm(monkeypatch)
+    c3 = run_agent(AgentRequest(query="그 공고 마감일", company_id="c1",
+                                entry_context=EntryContext(),
+                                session_context=c2)).session_context
+    assert c3.recent_turns[-1] == c3.last_summary
+    assert len(c3.recent_turns) == 2      # 기타 턴은 안 쌓였다
+
+
+# ---- 구버전 백엔드 퇴화 감지 ----
+
+def test_warns_when_backend_dropped_recent_turns(monkeypatch, caplog):
+    """양성 — 공고를 다룬 턴은 반드시 recent_turns도 채운다. 그런데 비어서
+    돌아왔다면 백엔드가 필드를 버린 것이다."""
+    import logging
+    _mock_llm(monkeypatch)
+    ctx = _sc([], bid_ids=["R001"], summary="상세 1건 안내 — 가")
+    with caplog.at_level(logging.WARNING):
+        run_agent(AgentRequest(query="q", company_id="c1",
+                               entry_context=EntryContext(), session_context=ctx))
+    assert any("recent_turns" in r.message for r in caplog.records)
+
+
+def test_no_warning_when_first_turn_was_out_of_scope(monkeypatch, caplog):
+    """음성(오탐 방지) — 첫 턴이 기타면 last_summary만 차고 recent_turns는 빈
+    채로 정상 반환된다. 백엔드 탓이 아니므로 경고가 뜨면 안 된다."""
+    import logging
+    _mock_llm(monkeypatch)
+    ctx = _sc([], bid_ids=[], summary="업무 밖 질의")
+    with caplog.at_level(logging.WARNING):
+        run_agent(AgentRequest(query="q", company_id="c1",
+                               entry_context=EntryContext(), session_context=ctx))
+    assert not any("recent_turns" in r.message for r in caplog.records)
 
 
 def test_missing_verdict_for_entry_bid_says_so(monkeypatch):
