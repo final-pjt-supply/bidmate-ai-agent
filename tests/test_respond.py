@@ -1,12 +1,13 @@
 ﻿import logging
 
 import agents.nodes.respond as respond_mod
-from agents.nodes.respond import (BidItem, RespondOutput, build_summary,
-                                  check_grounding, render_answer,
-                                  respond_node, sanitize)
+from agents.nodes.respond import (BidItem, RespondOutput, _eligibility_block,
+                                  build_summary, check_grounding,
+                                  render_answer, respond_node, sanitize)
 from agents.nodes.stubs import (eligibility_node, retrieval_node,
                                 scoring_node)
-from agents.schemas import EntryContext, Filters, QueryIntent
+from agents.schemas import (AxisResult, EligibilityResult, EntryContext,
+                            FailedReason, Filters, QueryIntent)
 
 
 def _state():
@@ -288,3 +289,85 @@ def test_grounding_zero_strip_does_not_widen_to_other_numbers():
     signals = "마감 2026-07-30 10:00"
     violations = check_grounding("마감은 8월 3일입니다", signals)
     assert "8" in violations and "3" in violations
+
+
+# ── 자격 신호 보강: 확인필요 갈래(N-4b) · 보완 경로(N-5) ──────────────
+# 신호는 LLM이 읽는 유일한 사실 원천이다. 여기 안 실리면 답변에 나올 수 없고,
+# 잘못 실리면 그대로 사용자에게 간다. 그래서 문자열을 직접 본다.
+
+def _axis(axis, cls="gate", status="충족"):
+    return AxisResult(axis=axis, axis_class=cls, status=status)
+
+
+def _elig(verdict, *, axes=(), failed=(), need_review=0,
+          required=0, satisfied=0, bid_id="R26BK_T01"):
+    return EligibilityResult(
+        bid_id=bid_id, passed=(verdict == "가능"), verdict=verdict,
+        axes=list(axes), failed_reasons=list(failed),
+        required_count=required, satisfied_count=satisfied,
+        need_review_count=need_review)
+
+
+def _sig(result):
+    return _eligibility_block({"eligibility": [result], "eligible_total": 0})
+
+
+def test_N4b_확인필요_축이_있으면_그_개수를_말한다():
+    sig = _sig(_elig("확인필요", axes=[_axis("license"), _axis("cert", "supp",
+                                                             "확인필요")],
+                     need_review=2, required=2, satisfied=0))
+    assert "확인 필요한 축 2개" in sig
+
+
+def test_N4b_게이트_축이_하나도_없으면_추출_실패라고_말한다():
+    # 캡 유래(D-22 계열) — failed_reasons가 비는 것이 정상인 갈래다
+    sig = _sig(_elig("확인필요", axes=[_axis("cert", "supp", "미충족")]))
+    assert "추출하지 못해 판정 보류" in sig
+    assert "확인 필요한 축" not in sig
+
+
+def test_N4b_게이트_축은_있는데_사유가_없으면_요건_결측이라고_말한다():
+    # 캡 유래(D-23 계열) — 유형별 기대 축이 빠진 경우
+    sig = _sig(_elig("확인필요", axes=[_axis("size")], required=1, satisfied=1))
+    assert "요건 정보가 일부 없어 판정 보류" in sig
+
+
+def test_N4b_확인필요가_아니면_보류_문구를_붙이지_않는다():
+    for verdict in ("가능", "불가", "보완가능"):
+        sig = _sig(_elig(verdict, axes=[_axis("license")]))
+        assert "판정 보류" not in sig, verdict
+
+
+def test_N5_supp_축_미달에는_보완_경로가_붙는다():
+    sig = _sig(_elig("보완가능",
+                     axes=[_axis("license")],
+                     failed=[FailedReason(field="performance",
+                                          required="5억원", actual="3억원")]))
+    assert "요구 5억원 / 보유 3억원 → " in sig
+    assert "공동수급" in sig
+
+
+def test_N5_게이트_축_미달에는_보완_경로가_없다():
+    # 면허·지역·규모는 "보완해서 되는" 성질이 아니다 — 억지 유도 금지
+    sig = _sig(_elig("불가",
+                     failed=[FailedReason(field="license",
+                                          required="전기공사업", actual="정보통신공사업")]))
+    assert "요구 전기공사업 / 보유 정보통신공사업" in sig
+    assert "→" not in sig
+
+
+def test_N5_미등록_보유값은_게이트_축이라도_프로필_입력을_유도한다():
+    sig = _sig(_elig("불가",
+                     failed=[FailedReason(field="license",
+                                          required="전기공사업", actual="(없음)")]))
+    assert "→" in sig and "프로필" in sig
+
+
+def test_N5_여러_사유가_섞여도_해당_축에만_붙는다():
+    sig = _sig(_elig("불가",
+                     failed=[FailedReason(field="region", required="경상북도",
+                                          actual="경기도"),
+                             FailedReason(field="cert", required="ISO 45001",
+                                          actual="보유 인증 3종")]))
+    assert sig.count("→") == 1                     # cert 에만
+    assert "경상북도 / 보유 경기도;" in sig or "경상북도 / 보유 경기도 |" in sig
