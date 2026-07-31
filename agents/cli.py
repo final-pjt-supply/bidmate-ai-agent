@@ -4,13 +4,19 @@
 명령: /reset 세션 초기화, /ctx 현재 컨텍스트 출력, /exit 종료
 """
 import logging
+import os
 
 from agents.run import run_agent
 from agents.schemas import AgentRequest, EntryContext
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+if os.getenv("LOG_JSON"):
+    # 수집 파이프 검증용 — 서비스와 같은 JSON 한 줄 출력 (L1)
+    from agents.logging_util import setup_json_logging
+    setup_json_logging()
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
 

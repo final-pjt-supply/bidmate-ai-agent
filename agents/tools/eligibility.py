@@ -159,7 +159,11 @@ def evaluate_eligibility(
                     "eligibility 판정 미제공 %d/%d건 (company_id=%s): %s",
                     len(missing), len(bid_ids), company_id,
                     "; ".join(f"{why} {len(bs)}건 {bs}"
-                              for why, bs in grouped.items()))
+                              for why, bs in grouped.items()),
+                    extra={"event": "no_verdict",
+                           "n_closed": len(grouped.get(MISSING_CLOSED, [])),
+                           "n_not_found": len(grouped.get(MISSING_NOT_FOUND, [])),
+                           "n_no_data": len(grouped.get(MISSING_NO_DATA, []))})
             except Exception:  # noqa: BLE001
                 # 진단은 관측 보조일 뿐이다 — 진단 쿼리 실패가 이미 확보한
                 # 판정 반환까지 막으면 주객이 바뀐다.
