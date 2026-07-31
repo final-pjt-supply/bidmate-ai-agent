@@ -9,7 +9,8 @@ DB 함수(compute_match_results) 자체의 정확성은 SQL 쪽 책임이고, �
 axes의 required/actual은 compute 2026-07-27 배포부터 실린다. 이 파일은 두
 경로를 모두 덮는다: 키가 있을 때(정상)와 없을 때(구버전 DB → 폴백).
 """
-from agents.tools.eligibility import _to_result
+import agents.tools.eligibility as eligibility_mod
+from agents.tools.eligibility import _to_result, evaluate_eligibility
 
 # compute의 ax_* CTE 전체. 축이 추가되면 여기도 늘려야 한다.
 _ALL_AXES = ("license", "region", "size", "direct_prod", "item",
@@ -202,3 +203,41 @@ def test_모르는_축이_와도_나머지는_살아남는다():
     assert [a.axis for a in result.axes] == ["region"]
     # 사유 쪽도 마찬가지 — 모르는 class/status는 원래부터 걸러진다
     assert [r.field for r in result.failed_reasons] == ["region"]
+
+
+# ─────────────── 입력 순서 보존 (N-1, 2026-07-30) ───────────────
+# scope 노드는 마감 임박 순으로 고른 bid_ids를 넘기는데, _fetch의 SQL에는
+# ORDER BY가 없어 행 순서가 플랜(해시 조인 등)에 좌우된다. 도구가 입력 순서를
+# 복원하지 않으면 respond 신호에서 공고 목록 블록(scope 순서)과 자격 판정
+# 블록(DB 순서)이 어긋난다. 순서는 호출 계약의 속성이므로 여기(DB 없이)서 지킨다.
+
+def _rows_of(*bid_ids):
+    return [_row("가능", [], bid_id=b) for b in bid_ids]
+
+
+def test_N1_bid_ids_지정_시_입력_순서를_보존한다(monkeypatch):
+    # DB가 어떤 순서로 돌려주든 결과는 요청 순서다
+    monkeypatch.setattr(eligibility_mod, "_fetch",
+                        lambda cid, bids: _rows_of("C", "A", "B"))
+    out = evaluate_eligibility("9001", bid_ids=["A", "B", "C"])
+    assert [r.bid_id for r in out] == ["A", "B", "C"]
+
+
+def test_N1_bid_ids_미지정이면_정렬하지_않는다(monkeypatch):
+    """전건 조회(백엔드 경로)는 순서 계약이 없다 — DB가 준 순서 그대로.
+
+    (이 경로의 유용순 정렬은 대화 상한 초과 시 노드 _cap의 책임이다)"""
+    monkeypatch.setattr(eligibility_mod, "_fetch",
+                        lambda cid, bids: _rows_of("C", "A", "B"))
+    out = evaluate_eligibility("9001")
+    assert [r.bid_id for r in out] == ["C", "A", "B"]
+
+
+def test_N1_요청에_없는_공고는_터지지_않고_맨_뒤로_보낸다(monkeypatch):
+    """정상 경로에선 나올 수 없지만(_fetch가 ANY로 거른다) 방어적으로.
+
+    KeyError로 판정 전체가 죽는 것보다, 낯선 공고가 뒤에 붙는 편이 낫다."""
+    monkeypatch.setattr(eligibility_mod, "_fetch",
+                        lambda cid, bids: _rows_of("X", "A"))
+    out = evaluate_eligibility("9001", bid_ids=["A"])
+    assert [r.bid_id for r in out] == ["A", "X"]

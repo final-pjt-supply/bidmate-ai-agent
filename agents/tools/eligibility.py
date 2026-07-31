@@ -61,10 +61,29 @@ def evaluate_eligibility(
                  None이면 회원의 라이브 공고 전체. [D1 잠정]
 
     Returns:
-        EligibilityResult 리스트. 결과가 없으면 빈 리스트.
+        EligibilityResult 리스트. bid_ids를 지정했으면 **그 순서대로** 돌려준다.
+        결과가 없으면 빈 리스트.
     """
     rows = _fetch(company_id, bid_ids)
-    return [_to_result(r) for r in rows]
+    results = [_to_result(r) for r in rows]
+
+    if bid_ids:
+        # 입력 순서 복원. _fetch의 SQL에는 ORDER BY가 없어 행 순서가 플랜
+        # (해시 조인 등)에 좌우된다. 호출자(scope 노드)는 마감 임박 순으로
+        # 고른 bid_ids를 넘기는데, 여기서 순서가 섞이면 respond 신호에서
+        # 공고 목록 블록(scope 순서)과 자격 판정 블록(DB 순서)이 서로
+        # 어긋난다 — "마감 임박 5건"이라 말하며 순서는 아닌 답이 나간다.
+        #
+        # SQL(array_position) 대신 파이썬에서 정렬하는 이유: 순서는 조회
+        # 결과가 아니라 호출 계약의 속성이고, 이쪽이 DB 없이 테스트된다.
+        # 요청에 없는 bid_id는 정상 경로에선 나오지 않지만(_fetch가
+        # ANY(bid_ids)로 거른다) 방어적으로 맨 뒤에 둔다.
+        pos = {b: i for i, b in enumerate(bid_ids)}
+        results.sort(key=lambda r: pos.get(r.bid_id, len(pos)))
+
+    # bid_ids 미지정(전건) 경로는 정렬 계약이 없다 — DB가 준 순서 그대로.
+    # 대화 상한을 넘는 경우의 유용순 정렬은 노드(_cap)의 책임이다.
+    return results
 
 
 def _fetch(company_id: str, bid_ids: list[str] | None) -> list[dict]:
