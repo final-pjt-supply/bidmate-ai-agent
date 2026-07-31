@@ -205,6 +205,22 @@ def test_모르는_축이_와도_나머지는_살아남는다():
     assert [r.field for r in result.failed_reasons] == ["region"]
 
 
+def test_캡_산출_확인필요는_사유가_비는_게_정상이다():
+    """v2.2~v2.3 확인필요 캡(D-22 게이트 축 0개 supp 미충족 / D-23 기대 게이트
+    결측)은 사유가 '미충족인 축'이 아니라 '없는 축'이다 — failed_reasons가
+    비어야 한다. 이걸 버그로 오인해 사유를 만들어 채우면 그게 회귀다.
+    소비처가 이 갈래를 알아보는 시그니처는 need_review_count == 0 이다."""
+    row = _row("확인필요", [
+        {"axis": "region", "class": "gate", "status": "충족",
+         "detail": "제한없음", "required": "제한없음", "actual": "서울"},
+    ])
+    row.update(required=1, satisfied=1, need_review=0)
+    result = _to_result(row)
+    assert result.verdict == "확인필요"
+    assert result.failed_reasons == []       # 전 축 충족인데 확인필요 = 캡 산출
+    assert result.need_review_count == 0
+
+
 # ─────────────── 입력 순서 보존 (N-1, 2026-07-30) ───────────────
 # scope 노드는 마감 임박 순으로 고른 bid_ids를 넘기는데, _fetch의 SQL에는
 # ORDER BY가 없어 행 순서가 플랜(해시 조인 등)에 좌우된다. 도구가 입력 순서를

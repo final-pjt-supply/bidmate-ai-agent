@@ -14,6 +14,12 @@ axes 항목은 [{axis, class(gate|supp), status(충족|미충족|확인필요),
   detail, required, actual}].
   (Phase3 2026-07-29: info class 폐지 — cert·credit supp 격상. 파서는 과거
    데이터 호환을 위해 info 를 여전히 수용하되, 신규 데이터에는 나타나지 않는다.)
+  (v2.2~v2.3 2026-07-30: verdict 층에 '확인필요 캡' 2종 추가 — 게이트 축 0개의
+   supp 미충족(D-22), 유형별 기대 게이트 결측(D-23: 물품인데 item 축 없음 등).
+   ★ 이로써 verdict='확인필요'인데 미충족·확인필요 status의 축이 하나도 없는
+   행이 정상적으로 존재한다 — 사유가 '미충족인 축'이 아니라 '없는 축'이므로.
+   그 경우 failed_reasons는 비는 게 맞다. 소비처(respond 등)는 "사유 없음 =
+   문제 없음"으로 읽지 말 것. 시그니처: need_review_count == 0 인 확인필요.)
   required/actual은 compute 2026-07-27 배포부터 실린다. detail은 사람이 읽는
   한 줄 요약으로 유지되며(하위호환), 기계가 쪼개는 용도가 아니다.
 
@@ -152,7 +158,7 @@ def _to_result(row: dict) -> EligibilityResult:
     return EligibilityResult(
         bid_id=row["bid_id"],
         passed=passed,
-        verdict=row["verdict"],        # 게이트 3-state 원문 보존 (D2(B))
+        verdict=row["verdict"],        # 4-state 원문 보존 (D2(B))
         failed_reasons=reasons,
         axes=_to_axes(row.get("axes")),
         required_count=row.get("required") or 0,
