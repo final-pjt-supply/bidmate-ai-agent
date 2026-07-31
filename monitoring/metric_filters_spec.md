@@ -14,7 +14,8 @@ row에 격리). 메트릭 필터는 로그 유입 시점에 한 번 숫자를 �
 
 | # | 필터 이름 | 패턴 | 값 | 차원 | 만들어지는 패널 |
 |---|---|---|---|---|---|
-| 1 | turn-count | `{ $.event = "turn_end" }` | `1` | route=`$.route`, result=`$.result` | 대화량, route 분포, 결과 유형 분포, 오류율 분모 |
+| 1a | turn-count | `{ $.event = "turn_end" }` | `1` | route=`$.route` | 대화량, route 분포, 오류율 분모 |
+| 1b | turn-result | `{ $.event = "turn_end" }` | `1` | result=`$.result` | 결과 유형 분포(D2) |
 | 2 | turn-latency | `{ $.event = "turn_end" }` | `$.total_ms` | route=`$.route` | 턴 지연 p50/p95 (통계는 CW가 계산) |
 | 3 | llm-tokens-in | `{ $.event = "llm_call" }` | `$.tokens_in` | tier=`$.tier` | 티어별 입력 토큰(비용 정밀판 — 네이티브 메트릭과 교차 검증) |
 | 4 | llm-tokens-out | `{ $.event = "llm_call" }` | `$.tokens_out` | tier=`$.tier` | 티어별 출력 토큰 |
@@ -25,8 +26,15 @@ row에 격리). 메트릭 필터는 로그 유입 시점에 한 번 숫자를 �
 | 9 | no-verdict-notfound | `{ $.event = "no_verdict" }` | `$.n_not_found` | - | 〃 (공고없음) |
 | 10 | no-verdict-nodata | `{ $.event = "no_verdict" }` | `$.n_no_data` | - | 〃 (판정미산출 — 151건 갈래 관측) |
 
-메트릭 이름은 필터 이름의 CamelCase(TurnCount, TurnLatencyMs, LlmTokensIn, ...)로 통일.
-단위: ms 값은 Milliseconds, 나머지 Count.
+메트릭 이름은 필터 이름의 CamelCase(TurnCount, TurnResult, TurnLatencyMs, LlmTokensIn, ...)로
+통일. 단위: ms 값은 Milliseconds, 나머지 Count.
+
+> 왜 1a/1b로 쪼갰나 (2026-07-31 D1·D2 설계 중 정정): 한 메트릭에 route·result
+> 차원을 둘 다 걸면 CloudWatch에는 (route×result) 조합별 시리즈만 생겨서,
+> "route별 합계"나 "result별 합계"를 Grafana에서 뽑으려면 매번 SEARCH 수식으로
+> 재집계해야 한다. 같은 로그 패턴에 1차원 필터 두 개를 거는 쪽이 조회가 단순하고
+> 비용도 같다(메트릭 필터 자체는 무료, 커스텀 메트릭 과금은 시리즈 수 기준 — 조합
+> 폭발이 없어 오히려 저렴). 필터 총수 10 → 11.
 
 ## 아직 로그가 안 나와서 만들 수 없는 필터 (선행 작업 필요)
 
