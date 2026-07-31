@@ -15,7 +15,7 @@ import types
 
 import agents.tools.eligibility as eligibility_mod
 from agents.tools.eligibility import (_to_result, evaluate_eligibility,
-                                      missing_verdict_reasons)
+                                      missing_verdict_reasons, remedy_hint)
 
 # compute의 ax_* CTE 전체. 축이 추가되면 여기도 늘려야 한다.
 _ALL_AXES = ("license", "region", "size", "direct_prod", "item",
@@ -320,3 +320,31 @@ def test_N2_전부_찾았으면_진단_쿼리를_부르지_않는다(monkeypatch
     monkeypatch.setitem(sys.modules, "agents.tools.bid_info", fake)
     evaluate_eligibility("9001", bid_ids=["A", "B"])
     assert called == []                       # 누락이 없으면 추가 왕복도 없다
+
+
+# ─────────────── 보완 경로 힌트 (N-5, 2026-07-31) ───────────────
+# supp 미달 축의 "다음 행동"을 신호에 실을 정적 지식. 게이트 축에는 힌트를
+# 만들지 않는다(성립하지 않는 행동 유도 방지). 예외는 미등록 계열 하나뿐.
+
+def test_N5_supp_축은_전부_보완_경로가_있다():
+    for axis in ("performance", "capacity", "personnel",
+                 "cert", "credit", "direct_prod"):
+        assert remedy_hint(axis), axis
+
+
+def test_N5_게이트_축과_모르는_축은_힌트가_없다():
+    for axis in ("license", "region", "size", "item", "미래축"):
+        assert remedy_hint(axis) is None, axis
+
+
+def test_N5_미등록_보유값은_축과_무관하게_프로필_입력_유도다():
+    # 게이트 축(license)이라도 미입력 공백이면 "입력하면 해소"가 유효하다
+    hint = remedy_hint("license", "(미등록)")
+    assert hint and "프로필" in hint
+    # supp 축도 미등록이면 축별 경로(공동수급 등)보다 입력 유도가 정확하다
+    assert remedy_hint("performance", "(없음)") == hint
+
+
+def test_N5_보유값이_실값이면_축별_경로를_준다():
+    hint = remedy_hint("performance", "3억원")
+    assert hint and "공동수급" in hint
