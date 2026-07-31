@@ -9,8 +9,13 @@ DB 함수(compute_match_results) 자체의 정확성은 SQL 쪽 책임이고, �
 axes의 required/actual은 compute 2026-07-27 배포부터 실린다. 이 파일은 두
 경로를 모두 덮는다: 키가 있을 때(정상)와 없을 때(구버전 DB → 폴백).
 """
+import logging
+import sys
+import types
+
 import agents.tools.eligibility as eligibility_mod
-from agents.tools.eligibility import _to_result, evaluate_eligibility
+from agents.tools.eligibility import (_to_result, evaluate_eligibility,
+                                      missing_verdict_reasons)
 
 # compute의 ax_* CTE 전체. 축이 추가되면 여기도 늘려야 한다.
 _ALL_AXES = ("license", "region", "size", "direct_prod", "item",
@@ -257,3 +262,61 @@ def test_N1_요청에_없는_공고는_터지지_않고_맨_뒤로_보낸다(mon
                         lambda cid, bids: _rows_of("X", "A"))
     out = evaluate_eligibility("9001", bid_ids=["A"])
     assert [r.bid_id for r in out] == ["A", "X"]
+
+
+# ─────────────── 판정 미제공 사유 진단 (N-2a, 2026-07-30) ───────────────
+# 같은 "판정 없음"이라도 마감/공고없음/판정미산출(라이브인데 요구조건 데이터
+# 미비 — 실측 151/1,470건)은 사용자에게 할 말이 다르다. 진단은 관측 보조라
+# 반환 계약을 바꾸지 않고, 실패해도 판정 반환을 막지 않아야 한다.
+# bid_info(psycopg 의존)는 sys.modules 주입으로 대체해 DB 없이 검증한다.
+
+def _fake_bid_info(monkeypatch, *, exists=(), live=(), boom=False):
+    def _fetch_info(ids):
+        if boom:
+            raise RuntimeError("DB down")
+        return {b: object() for b in ids if b in exists}
+
+    fake = types.SimpleNamespace(
+        fetch_bid_info=_fetch_info,
+        filter_open_bids=lambda ids: {b for b in ids if b in live},
+    )
+    monkeypatch.setitem(sys.modules, "agents.tools.bid_info", fake)
+
+
+def test_N2_사유_3갈래를_가른다(monkeypatch):
+    _fake_bid_info(monkeypatch, exists={"CLOSED", "LIVE"}, live={"LIVE"})
+    out = missing_verdict_reasons(["CLOSED", "GONE", "LIVE"])
+    assert out == {"CLOSED": "마감", "GONE": "공고없음", "LIVE": "판정미산출"}
+
+
+def test_N2_판정_없으면_사유를_로그에_남기고_반환은_그대로다(monkeypatch, caplog):
+    monkeypatch.setattr(eligibility_mod, "_fetch", lambda cid, bids: [])
+    _fake_bid_info(monkeypatch, exists={"CLOSED"}, live=set())
+    with caplog.at_level(logging.WARNING):
+        out = evaluate_eligibility("9001", bid_ids=["CLOSED", "GONE"])
+    assert out == []                          # 반환 계약 불변 — 로그만 남긴다
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "마감" in joined and "공고없음" in joined
+
+
+def test_N2_진단이_죽어도_판정_반환은_산다(monkeypatch, caplog):
+    monkeypatch.setattr(eligibility_mod, "_fetch",
+                        lambda cid, bids: _rows_of("A"))
+    _fake_bid_info(monkeypatch, boom=True)
+    with caplog.at_level(logging.WARNING):
+        out = evaluate_eligibility("9001", bid_ids=["A", "GONE"])
+    assert [r.bid_id for r in out] == ["A"]   # 확보한 판정은 그대로 나간다
+    assert any("진단 실패" in r.getMessage() for r in caplog.records)
+
+
+def test_N2_전부_찾았으면_진단_쿼리를_부르지_않는다(monkeypatch):
+    monkeypatch.setattr(eligibility_mod, "_fetch",
+                        lambda cid, bids: _rows_of("A", "B"))
+    called = []
+    fake = types.SimpleNamespace(
+        fetch_bid_info=lambda ids: called.append(ids) or {},
+        filter_open_bids=lambda ids: set(),
+    )
+    monkeypatch.setitem(sys.modules, "agents.tools.bid_info", fake)
+    evaluate_eligibility("9001", bid_ids=["A", "B"])
+    assert called == []                       # 누락이 없으면 추가 왕복도 없다
