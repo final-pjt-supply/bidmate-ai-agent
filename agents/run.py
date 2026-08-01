@@ -1,6 +1,9 @@
 """진입점 — 프레임워크 비의존 순수 함수. 백엔드 호출 방식 확정 전까지 유지."""
 import logging
+import time
 from functools import lru_cache
+
+from agents.logging_util import log_turn_end, new_request_id
 
 from agents.graph import build_graph
 from agents.nodes.eligibility import eligibility_node
@@ -106,6 +109,10 @@ def _initial_state(req: AgentRequest) -> dict:
 
 def run_agent(req: AgentRequest) -> AgentResponse:
     _warn_if_context_degraded(req.session_context)
+    # 턴 상관 ID 발급 + 메트릭 초기화 (L1). 이후 이 턴의 모든 로그(노드·LLM·
+    # 도구)에 request_id가 자동으로 붙는다 — 한 턴을 로그에서 묶는 열쇠다.
+    new_request_id()
+    t0 = time.monotonic()
     result = _graph().invoke(_initial_state(req))
     action = _ROUTE_ACTION[result["route"]]
     resolved = Filters(**(result["resolved_filters"] or {}))
@@ -126,6 +133,9 @@ def run_agent(req: AgentRequest) -> AgentResponse:
             last_filters=prev.last_filters if prev else Filters(),
             pending=None,
         )
+        log_turn_end(route=result["route"], action="clarify",
+                     result="out_of_scope",
+                     total_ms=round((time.monotonic() - t0) * 1000))
         return AgentResponse(action="clarify", clarify_message=OUT_OF_SCOPE,
                              session_context=ctx)
 
@@ -138,6 +148,9 @@ def run_agent(req: AgentRequest) -> AgentResponse:
             last_filters=prev.last_filters if prev else Filters(),
             pending=None,                    # pending은 항상 리셋
         )
+        log_turn_end(route=result["route"], action="redirect",
+                     result="redirect",
+                     total_ms=round((time.monotonic() - t0) * 1000))
         return AgentResponse(action="redirect", redirect_filters=resolved,
                              session_context=ctx)
 
@@ -158,16 +171,22 @@ def run_agent(req: AgentRequest) -> AgentResponse:
     if result["route"] == "자격" and not result["eligibility"]:
         # 판정 대상이 없다. 진입 공고가 있었다면 "그 공고 판정을 못 구했다"이고,
         # 없었다면 "자격 되는 공고가 없다"이다.
-        answer = _NO_VERDICT if req.entry_context.bid_id else _NO_ELIGIBLE
+        if req.entry_context.bid_id:
+            answer, result_code = _NO_VERDICT, "no_verdict"
+        else:
+            answer, result_code = _NO_ELIGIBLE, "no_eligible"
     elif result["answer"] is None:
-        answer = _NOT_FOUND                  # 공고를 특정하지 못해 노드를 안 탔다
+        answer, result_code = _NOT_FOUND, "not_found"   # 공고 특정 실패 — 노드 안 탐
     else:
-        answer = result["answer"]
+        answer, result_code = result["answer"], "answer"
 
     summary = build_summary(result)
     ctx = SessionContext(last_bid_ids=bids,
                          last_summary=summary,
                          recent_turns=_push_turn(req.session_context, summary),
                          last_filters=storable, pending=None)
+    log_turn_end(route=result["route"], action="answer", result=result_code,
+                 total_ms=round((time.monotonic() - t0) * 1000),
+                 bids_shown=len(bids))
     return AgentResponse(action="answer", answer=answer,
                          citations=result["citations"], session_context=ctx)

@@ -1,0 +1,11 @@
+# /etc/logrotate.d/bidmate-agent 로 설치.
+# copytruncate 필수: systemd append: 가 파일 디스크립터를 계속 쥐고 있어서
+# rename 방식 로테이트는 회전 후에도 옛 파일에 계속 쓴다.
+/var/log/bidmate-agent/agent.jsonl {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

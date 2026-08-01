@@ -15,6 +15,7 @@ from agents import llm
 from agents.llm import ModelTier
 from agents.logging_util import node_logger
 from agents.schemas import Citation
+from agents.tools.eligibility import remedy_hint
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ _TASK_ELIGIBILITY = """\
 headline에서 판정 결과(가능 / 미달)를 먼저 분명히 말한다. 돌려 말하지 마라.
 미달이면 어느 항목이 왜 미달인지 신호에 적힌 사유를 필드 단위로 그대로 전달하고,
 보완하면 충족할 수 있는 항목이 있으면 그것도 알려준다.
+신호에 "→"로 적힌 보완 경로는 **그대로만** 전달하고, 없는 항목에 대해 보완 방법을
+지어내지 마라. "판정 보류"라고 적힌 공고를 통과로 말하지 마라.
 
 신호 머리줄에 "자격 '가능' 공고 N건 중 마감 임박 M건"이 있으면, **N을 먼저
 밝히고 지금 보여주는 것이 그중 M건임을 말한 뒤 더 볼지 물어라.** M건이 전부인
@@ -187,6 +190,28 @@ _VERDICT_LABEL = {
 }
 
 
+def _review_note(r) -> str:
+    """'확인필요'가 어느 갈래인지 한 줄로 (N-4b).
+
+    판정 함수 v2.2~v2.3의 '확인필요 캡' 2종(게이트 축 0개인데 supp 미충족 /
+    유형별 기대 게이트 결측)으로 나온 행은 **미충족 축이 아니라 '없는 축'이
+    사유**라, failed_reasons가 비는 것이 정상이다. 그대로 두면 신호가
+    "확인 필요 (충족 5/5축 | 충족: …)"로만 나가 LLM이 '문제 없음'으로 읽는다 —
+    실제로는 정반대(공고에서 요건을 못 뽑아 판정을 보류한 것)다.
+
+    갈래를 나누는 근거: need_review_count > 0 은 축 자체가 확인필요인 정상
+    경로. 0인데 게이트 축이 하나도 없으면 요건 추출 자체가 실패한 것(D-22
+    계열), 0인데 게이트 축은 있으면 유형별 기대 축이 빠진 것(D-23 계열).
+    D-22/D-23을 더 쪼개려면 공고 유형이 결과 계약에 있어야 하는데 지금은
+    없으므로 여기까지가 데이터로 말할 수 있는 분해다.
+    """
+    if r.need_review_count:
+        return f"확인 필요한 축 {r.need_review_count}개"
+    if not any(a.axis_class == "gate" for a in r.axes):
+        return "공고에서 자격 조건을 추출하지 못해 판정 보류"
+    return "요건 정보가 일부 없어 판정 보류"
+
+
 def _eligibility_block(state) -> str:
     """자격 판정 신호.
 
@@ -220,9 +245,21 @@ def _eligibility_block(state) -> str:
         met = [a.axis for a in r.axes if a.status == "충족"]
         if met:
             detail.append("충족: " + ", ".join(met))
+        if r.verdict == "확인필요":                      # N-4b
+            detail.append(_review_note(r))
         if r.failed_reasons:
-            detail.append("; ".join(f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
-                                    for f in r.failed_reasons))
+            # N-5: 미달 사유 뒤에 보완 경로를 붙인다. 문구는 도구 층의 정적
+            # 테이블(remedy_hint)이 고정한 것으로, LLM이 만들지 않는다 —
+            # 자격 안내는 틀리면 없느니만 못하다. supp 축과 '미등록' 보유값만
+            # 힌트를 받고 게이트 축은 None이라 그대로 지나간다.
+            parts = []
+            for f in r.failed_reasons:
+                line_ = f"{f.field}: 요구 {f.required} / 보유 {f.actual}"
+                hint = remedy_hint(f.field, f.actual)
+                if hint:
+                    line_ += f" → {hint}"
+                parts.append(line_)
+            detail.append("; ".join(parts))
         line = f"- {r.bid_id}: {label}"
         if detail:
             line += f" ({' | '.join(detail)})"

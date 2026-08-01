@@ -1,0 +1,32 @@
+# BidMate Agent systemd 유닛 — EC2의 /etc/systemd/system/에 설치 (인수인계 4-B)
+#   sudo cp deploy/bidmate-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now bidmate-agent
+#
+# 로깅 배선(L2): Environment=LOG_JSON=1 이 구조화 JSON 로깅을 켜고(service.py),
+# StandardOutput=append: 가 stdout을 journald 대신 파일로 직행시킨다(JSON 한 줄 보존).
+# LogsDirectory= 가 /var/log/bidmate-agent 를 서비스 계정 소유로 자동 생성한다.
+# 그 파일은 CloudWatch Agent(deploy/cloudwatch-agent.json)가 /bidmate/agent 로 수집.
+# ⚠ EnvironmentFile= 금지(.env 파싱 지뢰 — 인수인계 §6-3). LOG_JSON만 유닛에서 주입.
+
+[Unit]
+Description=BidMate Agent (LangGraph + Bedrock)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=bidmate
+WorkingDirectory=/opt/bidmate-agent
+Environment=LOG_JSON=1
+LogsDirectory=bidmate-agent
+StandardOutput=append:/var/log/bidmate-agent/agent.jsonl
+StandardError=append:/var/log/bidmate-agent/agent.jsonl
+ExecStart=/opt/bidmate-agent/.venv/bin/uvicorn agents.service:app \
+          --host 127.0.0.1 --port 8001 --workers 1
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

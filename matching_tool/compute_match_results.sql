@@ -181,6 +181,49 @@
 --     2026-07-29 밤 발견·수정). 이 행 덕에 전 회원 미입력(NULL) 동안 v2.0 판정 ≡ v1.5
 --     가 보장되고(배포 무위험), 분야 입력이 쌓이면 계열 검사가 추가로 조여진다.
 --   · 검증: d19_v2_verify.sql — 핵심은 ②(v1.5 캐시 대비 행 단위 완전 동등성 0건).
+--
+-- 2026-07-30(v2.1)  [D-20 표시] 면허 축 act_value — '충족 그룹 라벨'을 '충족에 쓴 면허'로.
+--   act_value 가 grp_label(요구측 대안 나열 통째)을 재사용하고 있어서, 그룹을 충족하면
+--   '우리 회사' 칸이 공고 요구와 글자까지 동일해졌다(전 그룹 충족 공고에서는 항상).
+--   D3-b 의미론(actual = 요구 중 우리가 충족한 항목) 위반 — 표시층만의 결함이고
+--   판정('충족')은 정확했다. lic_group 에 grp_hit_label(회사 면허와 실제 매칭된
+--   대안만 집계) 추가, act_value 는 충족 그룹의 hit 라벨을 DISTINCT 나열(같은 면허가
+--   여러 그룹을 충족하면 한 번만). verdict·카운터·출력 계약 불변 — 캐시는 야간
+--   전체 재계산(#80)으로 자동 전파, 즉시 반영은 수동 재계산.
+--
+-- 2026-07-30(v2.2)  [D-21·D-22] 맞춤추천 실사용 점검 후속 — 판정 신뢰도 가드 2건.
+--   · [D-21] 시공능력 헐값 임계 가드. 라이브 금액 요구 97건 중 87건이 1천만원 미만
+--     (76건은 1천원 미만) — 실물 확인 결과 비금액 요건('아스팔트 혼합물 플랜트' 등
+--     설비·용량·대수)이 금액으로 오적재된 것. D-07(≤0)이 못 거르는 양수 헐값이라
+--     min_value < 1천만원을 미해석 취급(확인필요)으로 확장. 분포가 이봉(10만~1천만
+--     구간 0건)이라 하한 1천만이 정상 요구(≥1천만 12건)를 안 건드린다.
+--     근본(추출·정규화에서 비금액 요건 분리)은 상류 요청 목록 등재 — 이 가드는 봉쇄다.
+--   · [D-22] 게이트 축 0개 공고의 '보완가능' 차단. 실측 보완가능 25건 중 21건(84%)이
+--     게이트 축 전무 — 물품 공고인데 품목 축조차 없음(추출 불완전 신호). '보완가능'
+--     서사("본질 자격은 갖췄고 보완만 남음")는 게이트 통과가 전제인데, 게이트가
+--     검증된 적 없는 공고의 supp 미충족을 낙관 판정하고 있었다(실사용 발견 — SW
+--     회사에 아스콘 공고가 '보완가능'). 축0개 가드와 같은 철학으로 확인필요로 낮춘다.
+--     per_bid 에 n_gate(내부 전용 카운터) 추가 — RETURNS TABLE·출력 계약 불변.
+--   ※ 이번 전이는 '대각선만'이 아니다 — 의도된 이동(보완가능→확인필요 ~21 +
+--     capacity 가드 유래)이 있다. d2122_verify.sql 로 방향·규모를 검증한다.
+--   ※ 유도 규칙이 바뀌므로 live 테스트 test_verdict가_축목록에서_다시_유도된다 의
+--     유도() 도 함께 개정(+ D-22 고정 테스트 신규) — 테스트 20종.
+--
+-- 2026-07-30(v2.3)  [D-23] 유형별 기대 게이트 결측 시 '가능' 차단.
+--   발단(실사용): 물품 공고인데 item 축 없이 규모 1/1 충족 → '가능'(SW 회사에
+--   코팅기·크레인 구매 공고가 가능으로). D-22의 사각지대 — 게이트가 '하나라도'
+--   있으면 통과하지만, 그 하나가 유형의 본질 게이트가 아닐 수 있다.
+--   근거(모집단 결측률, 라이브 1,305): 물품의 93.5%는 item 축 보유(결측 6.5%),
+--   용역의 92.7%·공사의 79%는 license 축 보유 — 유형별 '기대 게이트'가 통계로 뚜렷.
+--   ★ 선택 효과 주의: '가능' 목록의 결측 비율(예: 공사 가능 9건 전부 license 결측)은
+--     원인이 아니라 결과다 — 게이트가 제대로 추출된 공고는 미보유 회사에겐 '불가'로
+--     빠지므로, '가능'에는 결측 공고만 걸러져 남는다. 그래서 가드가 필요하다.
+--   규칙: thng(물품)인데 item 축 없음 / servc·cnstwk(용역·공사)인데 license 축 없음
+--   → 남은 낙관 경로(보완가능·가능)를 '확인필요'로 캡. frgcpt(외자)는 모수 39·근거
+--   부족으로 제외. 시뮬 이동량: 가능→확인필요 33건(물품 11·용역 13·공사 9).
+--   구현: bid_category 는 summary(live_bids s.*)에 이미 존재 — per_bid 에
+--   has_item/has_license(내부 전용)만 추가.
+--   출력 계약 불변. 검증 d23_verify.sql. live 테스트 21종(유도() 개정 + D-23 핀).
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.compute_match_results(p_company_id bigint)
@@ -198,6 +241,8 @@ WITH params AS (
 ),
 -- 라이브 공고 = 투찰마감 미도래. summary 전체 컬럼 보존(region_limit_type·normalizer_version 등).
 live_bids AS (
+  -- [D-23] bid_category(thng/servc/cnstwk/frgcpt)는 summary 가 이미 갖고 있어 s.* 에 포함
+  --   (bt.bid_category 를 중복 추가하면 42702 ambiguous — 2026-07-30 실배포에서 확인).
   SELECT s.*
   FROM bid_require_summary s
   JOIN bid_table bt USING (bid_ntce_no, bid_ntce_ord)
@@ -220,6 +265,10 @@ lic_group AS (
          -- [D3-b] OR 그룹 내부는 '또는'으로 묶는다. 표준명 없으면 원문(name_raw).
          COALESCE(STRING_AGG(DISTINCT COALESCE(r.license_name, r.name_raw), ' 또는 '),
                   '(미해석)')                  AS grp_label,
+         -- [D-20] 이 그룹에서 회사 보유 면허와 실제로 매칭된 대안만 — act_value 용.
+         --   그룹 충족(grp_match)이면 반드시 NOT NULL(BOOL_OR 와 같은 조건).
+         STRING_AGG(DISTINCT COALESCE(r.license_name, r.name_raw), '·')
+           FILTER (WHERE cl.license_code IS NOT NULL) AS grp_hit_label,
          -- [3차] 중복 판별 키. 라벨이 아니라 '면허코드 집합'으로 접어야 한다.
          --   같은 면허가 표준명/원문 두 표기로 들어오는 사례가 있어서
          --   (학술.연구용역 vs 학술연구용역업[업종코드1169],
@@ -240,7 +289,7 @@ lic_group AS (
 --   라벨은 짧은 쪽을 남긴다 — 표준명이 원문보다 짧은 경향이 있다.
 lic_dedup AS (
   SELECT DISTINCT ON (bid_ntce_no, bid_ntce_ord, grp_key)
-         bid_ntce_no, bid_ntce_ord, grp_match, grp_unresolved, grp_label
+         bid_ntce_no, bid_ntce_ord, grp_match, grp_unresolved, grp_label, grp_hit_label
   FROM lic_group
   ORDER BY bid_ntce_no, bid_ntce_ord, grp_key, length(grp_label), grp_label
 ),
@@ -251,7 +300,8 @@ ax_license AS (
               ELSE '확인필요' END AS status,
          COUNT(*) FILTER (WHERE grp_match) || '/' || COUNT(*) || ' 그룹 충족'          AS detail,
          left(STRING_AGG(grp_label, ', ' ORDER BY grp_label), 300)                    AS req_value,
-         COALESCE(left(STRING_AGG(grp_label, ', ' ORDER BY grp_label)
+         -- [D-20] 충족 그룹의 '매칭된 대안'만 나열 — 같은 면허가 여러 그룹을 충족하면 한 번.
+         COALESCE(left(STRING_AGG(DISTINCT grp_hit_label, ', ' ORDER BY grp_hit_label)
                        FILTER (WHERE grp_match), 300), '(없음)')                      AS act_value
   FROM lic_dedup GROUP BY 1,2
 ),
@@ -632,13 +682,15 @@ cap_rows AS (
   SELECT r.bid_ntce_no, r.bid_ntce_ord,
          -- [D3-b] 업종(license_master) + 금액. license_code NULL 이면 총액 요건.
          -- [D-07] min_value <= 0 은 정규화 실패값 → 미해석 취급.
+         -- [D-21] 1천만원 미만 양수도 미해석 취급 — 비금액 요건(설비·용량·대수)의
+         --   오적재가 실측 87/97건. 분포 이봉(10만~1천만 0건)이라 하한 1천만이 안전.
          COALESCE(lm.license_name, '총액') || ' '
-           || CASE WHEN r.min_value IS NULL OR r.min_value <= 0 THEN '(미해석)'
+           || CASE WHEN r.min_value IS NULL OR r.min_value < 10000000 THEN '(미해석)'
                    WHEN r.min_value >= 100000000
                      THEN trim(to_char(r.min_value / 100000000.0, 'FM9999990.9')) || '억원'
                    ELSE to_char(r.min_value::numeric, 'FM999,999,999,999') || '원' END AS label,
          CASE
-           WHEN r.min_value IS NULL OR r.min_value <= 0 OR r.parse_status = 'unparsed' THEN NULL
+           WHEN r.min_value IS NULL OR r.min_value < 10000000 OR r.parse_status = 'unparsed' THEN NULL
            WHEN r.license_code IS NOT NULL THEN
              COALESCE((SELECT ce.eval_amount FROM company_capacity_evals ce, params p
                         WHERE ce.company_id = p.company_id AND ce.license_code = r.license_code),0) >= r.min_value
@@ -766,6 +818,11 @@ axis_all AS (
 per_bid AS (
   SELECT bid_ntce_no, bid_ntce_ord,
          COUNT(*) FILTER (WHERE class IN ('gate','supp'))                        AS required,
+         -- [D-22] 게이트 축 존재 카운터 — verdict CASE 내부 전용(출력 컬럼 아님).
+         COUNT(*) FILTER (WHERE class = 'gate')                                  AS n_gate,
+         -- [D-23] 유형별 기대 게이트 존재 여부 — verdict CASE 내부 전용.
+         BOOL_OR(axis = 'item')                                                  AS has_item,
+         BOOL_OR(axis = 'license')                                               AS has_license,
          COUNT(*) FILTER (WHERE class IN ('gate','supp') AND status = '충족')     AS satisfied,
          COUNT(*) FILTER (WHERE class = 'gate'           AND status = '미충족')   AS gate_failed,
          COUNT(*) FILTER (WHERE class IN ('gate','supp') AND status = '확인필요') AS need_review,
@@ -780,6 +837,17 @@ SELECT p.company_id,
        CASE WHEN COALESCE(b.required,0) = 0    THEN '확인필요'   -- [축0개] 아래 주석
             WHEN COALESCE(b.gate_failed,0) > 0 THEN '불가'
             WHEN COALESCE(b.need_review,0) > 0 THEN '확인필요'
+            -- [D-22] 게이트 축이 하나도 추출되지 않은 공고의 supp 미충족은 '보완가능'
+            --   이 아니라 '확인필요' — 게이트를 통과한 게 아니라 검증된 적이 없다.
+            WHEN COALESCE(b.n_gate,0) = 0
+                 AND COALESCE(b.satisfied,0) < COALESCE(b.required,0) THEN '확인필요'
+            -- [D-23] 유형별 기대 게이트 결측 — 물품인데 품목 축 없음 / 용역·공사인데
+            --   면허 축 없음. 이 지점까지 왔으면 남은 경로는 보완가능·가능뿐이므로
+            --   확인필요로 캡한다(불가·기존 확인필요는 위 분기에서 이미 확정).
+            WHEN (s.bid_category = 'thng'
+                  AND NOT COALESCE(b.has_item, false))
+              OR (s.bid_category IN ('servc','cnstwk')
+                  AND NOT COALESCE(b.has_license, false)) THEN '확인필요'
             WHEN COALESCE(b.satisfied,0) < COALESCE(b.required,0) THEN '보완가능'
             ELSE '가능' END::TEXT,
        COALESCE(b.required,0)::INT,

@@ -1,6 +1,7 @@
 # bidmate-backend가 이 저장소를 pip 패키지로 설치하기 위한 메타데이터.
 # (backend requirements: bidmate-agents @ git+https://github.com/final-pjt-supply/bidmate-ai-agent.git)
-# 근거: docs/adr/0005 — 에이전트는 백엔드 FastAPI 프로세스에 라이브러리로 임베드.
+# 근거: 에이전트를 백엔드 프로세스에서 분리해 별도 프로세스(127.0.0.1:8001)로 운영.
+# 의존성 분리: 백엔드는 계약(schemas.py)만 가져가고, 런타임 전체는 [runtime] extra로 뺀다.
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
@@ -11,9 +12,18 @@ version = "0.1.0"
 description = "BidMate 입찰 공고 질의응답 에이전트 (LangGraph + Bedrock Claude)"
 # StrEnum(schemas.py)이 3.11+, 배포 대상은 EC2 Ubuntu 24.04의 Python 3.12.
 requires-python = ">=3.11"
+# base = 백엔드가 계약(schemas.py)만 가져갈 때 필요한 최소.
+# schemas.py는 pydantic + 표준 라이브러리(StrEnum)만 쓴다. agents/__init__.py는
+# 비어 있어 base 설치만으로 `from agents.schemas import ...`가 동작한다.
 dependencies = [
-    "langgraph",
     "pydantic>=2",
+]
+
+[project.optional-dependencies]
+# 에이전트 프로세스(service.py + run_agent)를 실제로 돌릴 때 필요한 전체.
+# 배포/개발 설치: pip install -e ".[runtime]"
+runtime = [
+    "langgraph",
     "pydantic-settings>=2.2",
     "boto3",
     "python-dotenv",
@@ -22,6 +32,13 @@ dependencies = [
     "httpx>=0.27",
     "psycopg[binary]>=3.1",
     "psycopg-pool>=3.2",
+    # HTTP 래퍼 (agents/service.py)
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+# 테스트: pip install -e ".[runtime,dev]"
+dev = [
+    "pytest",
 ]
 
 [tool.setuptools]

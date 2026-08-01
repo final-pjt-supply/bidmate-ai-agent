@@ -13,6 +13,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, ReadTimeoutError
 from dotenv import load_dotenv
 
+from agents.logging_util import add_turn_metric
+
 logger = logging.getLogger(__name__)
 load_dotenv()
 
@@ -91,6 +93,24 @@ def invoke(tier: ModelTier, messages: list[dict], system: str | None = None,
                 raise ValueError(
                     "Bedrock 응답에 text 블록이 없습니다 (content types=%s)"
                     % [b.get("type") for b in payload["content"]])
+
+            # LLM 사용량 계측 (L1, 2026-07-31). Bedrock 응답의 usage를 그동안
+            # 버리고 있었다. latency는 성공한 이 호출의 순수 지연이다(재시도
+            # 대기 제외 — start가 attempt마다 갱신되므로). 없어도 죽지 않는다.
+            usage = payload.get("usage") or {}
+            ms = (time.monotonic() - start) * 1000
+            logger.info(
+                "llm_call tier=%s latency_ms=%.0f tokens_in=%s tokens_out=%s "
+                "attempt=%d", tier, ms, usage.get("input_tokens"),
+                usage.get("output_tokens"), attempt,
+                extra={"event": "llm_call", "tier": str(tier),
+                       "latency_ms": round(ms),
+                       "tokens_in": usage.get("input_tokens"),
+                       "tokens_out": usage.get("output_tokens"),
+                       "attempt": attempt})
+            add_turn_metric("llm_calls", 1)
+            add_turn_metric("tokens_in", int(usage.get("input_tokens") or 0))
+            add_turn_metric("tokens_out", int(usage.get("output_tokens") or 0))
             return json.loads(text) if output_schema else text
         except (ClientError, ReadTimeoutError) as e:
             ms = (time.monotonic() - start) * 1000
@@ -102,11 +122,17 @@ def invoke(tier: ModelTier, messages: list[dict], system: str | None = None,
                 code = "ReadTimeoutError"
             if attempt == _MAX_ATTEMPTS:
                 logger.warning("llm retry exhausted attempts=%d code=%s",
-                               attempt, code)
+                               attempt, code,
+                               extra={"event": "llm_retry_exhausted",
+                                      "tier": str(tier), "code": code,
+                                      "attempt": attempt})
                 raise
             delay = min(2 ** attempt + random.random(), 20)
             logger.warning("llm retry attempt=%d code=%s latency_ms=%.0f "
-                           "next_delay_s=%.1f", attempt, code, ms, delay)
+                           "next_delay_s=%.1f", attempt, code, ms, delay,
+                           extra={"event": "llm_retry", "tier": str(tier),
+                                  "code": code, "attempt": attempt,
+                                  "latency_ms": round(ms)})
             time.sleep(delay)
 
 

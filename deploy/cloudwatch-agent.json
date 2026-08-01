@@ -1,0 +1,17 @@
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/bidmate-agent/agent.jsonl",
+            "log_group_name": "/bidmate/agent",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 30,
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  }
+}
