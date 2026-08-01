@@ -10,6 +10,7 @@ from agents.llm import ModelTier
 from agents.merge import resolve_filters
 from agents.nodes import stubs
 from agents.run import run_agent
+from agents.tools.eligibility import MISSING_CLOSED
 from agents.schemas import (
     AgentRequest, EntryContext, Filters, PendingClarify, Region, SessionContext,
 )
@@ -485,11 +486,17 @@ def test_missing_verdict_for_entry_bid_says_so(monkeypatch):
     """특정 공고를 물었는데 판정이 없는 경우 — "자격 미달"로 읽히면 안 된다.
 
     마감된 공고는 match_results 계산 대상에서 빠지므로 판정이 없다.
+
+    [N-2b] 이제 사유에 따라 문구가 갈린다. 사유 판별은 DB를 타므로 여기서는
+    막고(단위 테스트), 이 시나리오가 뜻하는 '마감'을 돌려주게 한다. 사유별
+    문구 매핑 자체는 tests/test_run.py가 본다.
     """
     monkeypatch.setattr(eligibility_mod, "evaluate_eligibility",
                         lambda company_id, bid_ids=None, **kw: [])
+    monkeypatch.setattr(run_mod, "missing_verdict_reasons",
+                        lambda ids: {ids[0]: MISSING_CLOSED})
     _mock_llm(monkeypatch, route="자격")
     resp = run_agent(AgentRequest(query="우리 이 공고 자격 돼?", company_id="9001",
                                   entry_context=EntryContext(bid_id="R_CLOSED")))
-    assert resp.answer == run_mod._NO_VERDICT
+    assert resp.answer == run_mod._NO_VERDICT_CLOSED
     assert resp.answer != run_mod._NO_ELIGIBLE
