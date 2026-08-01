@@ -48,14 +48,26 @@ def test_each_route_passes_through(monkeypatch):
 
 
 def test_prompt_includes_entry_bid_and_last_summary(monkeypatch):
-    ctx = SessionContext(last_bid_ids=["R001"], last_summary="대전 5건 안내",
+    # 요약은 프로덕션과 같은 경로로 만든다. 하드코딩하면 build_summary의 형식이
+    # 바뀌어도 이 테스트가 낡은 입력으로 계속 통과한다.
+    from agents.nodes.respond import build_summary
+    from agents.state import BidBrief
+    summary = build_summary({
+        "eligibility": [], "chunks": [], "route": "검색",
+        "bid_briefs": [BidBrief(bid_id="R001", name="대전 하수관로 정비공사")],
+        "bid_names": {"R001": "대전 하수관로 정비공사"},
+        "resolved_filters": {"bid_ids": ["R001"]}})
+    ctx = SessionContext(last_bid_ids=["R001"], last_summary=summary,
                          last_filters=Filters(region=Region.DAEJEON))
     cap = _mock_llm(monkeypatch, {"route": "상세"})
     router_node(_state("그중 마감 임박한 것", entry_bid="R777", ctx=ctx))
     prompt = cap["messages"][0]["content"]
     assert "R777" in prompt                  # 진입 공고는 분류 단서다
-    assert "대전 5건 안내" in prompt
-    assert "R001" not in prompt              # 목록 ID 원문은 넣지 않는다
+    assert summary in prompt                 # 프로덕션과 같은 형식이 실린다
+    assert "대전 하수관로 정비공사" in prompt
+    # 접두사가 중복되지 않는다 — router가 "직전 턴 요약: "을 붙이므로
+    # build_summary는 붙이지 않는다
+    assert "직전 턴 요약: 직전 턴:" not in prompt
 
 
 def test_prompt_includes_original_query_when_pending(monkeypatch):

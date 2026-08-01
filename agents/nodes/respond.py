@@ -366,19 +366,57 @@ def check_grounding(answer: str, signals: str) -> list[str]:
     return violations
 
 
-def build_summary(state) -> str:
-    """last_summary — 결정적 템플릿(LLM 안 씀).
+# 요약에 이름을 실을 공고 수. 다음 턴이 "그 사업"을 풀기에 충분하면 되고,
+# 길어지면 라우터 프롬프트만 무거워진다.
+_SUMMARY_NAMES = 3
 
-    bid_ids는 조건이 아니라 공고 스코프이므로 제외한다. scope·bid_search가 이
-    키를 항상 채우기 때문에, 안 빼면 모든 요약이 "조건: bid_ids"가 되어 다음 턴
-    라우터 프롬프트(last_summary)에 의미 없는 토큰이 실린다.
+
+def build_summary(state) -> str:
+    """last_summary·recent_turns의 한 줄 — 결정적 템플릿(LLM 안 씀).
+
+    다음 턴의 rewrite 노드가 "그 사업"·"그중에서"를 실제 이름으로 풀 근거다.
+    그래서 건수만이 아니라 공고명을 함께 싣는다. 갈래도 적는다 — "더 보여줘"처럼
+    질의만으로는 무엇을 이어가는지 알 수 없는 경우에 필요하다.
+
+    **접두사를 붙이지 않는다.** 이 함수는 한 턴을 서술하기만 하고, "언제인지"는
+    읽는 쪽이 붙인다(rewrite._history_block의 `N턴 전` 라벨). 최근 10턴이 쌓이는데
+    전부 "직전 턴:"으로 시작하면 어느 게 언제인지 구분되지 않는다. router.py는
+    이미 자기 접두사("직전 턴 요약: ")를 붙이고 있어, 여기서 떼면 중복도 없어진다.
+
+    LLM을 쓰지 않는 것이 중요하다. 공고 문서의 악성 문구가 요약을 타고 다음 턴
+    프롬프트로 전파되는 2차 인젝션 경로를 막는 것이 이 함수가 결정적인 이유다
+    (ADR 0006). 공고명은 bid_table 원문이라 같은 성격의 입력이므로 sanitize를
+    거쳐 싣는다.
+
+    공고 순서는 판정 → 발췌 → 검색 요약 순으로 고정한다(집합을 쓰면 순서가
+    실행마다 달라져 "결정적 템플릿"이 아니게 된다).
+
+    bid_ids는 조건이 아니라 공고 스코프이므로 조건 목록에서 뺀다. scope·
+    bid_search가 이 키를 항상 채우기 때문에, 안 빼면 모든 요약이
+    "조건: bid_ids"가 되어 의미 없는 토큰이 실린다.
     """
-    bids = {r.bid_id for r in state["eligibility"]} | \
-           {c.bid_id for c in state["chunks"]} | \
-           {b.bid_id for b in (state.get("bid_briefs") or [])}
+    bids = list(dict.fromkeys(
+        [r.bid_id for r in state["eligibility"]] +
+        [c.bid_id for c in state["chunks"]] +
+        [b.bid_id for b in (state.get("bid_briefs") or [])]))
+    names = state.get("bid_names") or {}
+
+    label = state.get("route") or "공고"
+    summary = f"{label} {len(bids)}건 안내"
+
+    shown = [sanitize(_squeeze(names[b])) for b in bids[:_SUMMARY_NAMES]
+             if names.get(b)]
+    if shown:
+        summary += " — " + ", ".join(shown)
+        rest = len(bids) - len(shown)
+        if rest > 0:
+            summary += f" 외 {rest}건"
+
     keys = sorted(k for k in (state.get("resolved_filters") or {})
                   if k != "bid_ids")
-    return f"직전 턴: 공고 {len(bids)}건 안내 (조건: {', '.join(keys) or '없음'})"
+    if keys:
+        summary += f" (조건: {', '.join(keys)})"
+    return summary
 
 
 def _fallback_answer(state) -> str:
@@ -408,7 +446,9 @@ def respond_node(state: dict) -> dict:
         eligibility_block=_eligibility_block(state),
         scores_block=_scores_block(state),
         chunks_block=_chunks_block(state),
-        query=state["query"],
+        # 사용자가 실제로 한 말. rewrite가 재구성한 질의로 답하면 사용자가
+        # 하지 않은 말에 답하는 것처럼 읽힌다.
+        query=state.get("original_query") or state["query"],
     )
     messages = [{"role": "user", "content": prompt}]
 

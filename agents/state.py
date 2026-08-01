@@ -46,10 +46,18 @@ class BidBrief(BaseModel):
 
 class AgentState(TypedDict):
     # 입력 (백엔드가 주입)
+    #
+    # query는 "처리할 질의"다. rewrite 노드가 앞 대화를 가리키는 질의를
+    # 자기완결 문장으로 바꿔 여기 덮어쓰므로, 뒤 노드(router·bid_search·
+    # retrieval)는 항상 이 값을 쓰면 된다.
     query: str
     company_id: str
     entry_context: EntryContext
     session_context: SessionContext | None
+
+    # [0] rewrite 산출 — 사용자가 실제로 한 말. respond가 이걸 보고 답한다.
+    # 재구성본으로 답하면 사용자가 하지 않은 말에 답하는 것처럼 읽힌다.
+    original_query: str
 
     # [0] Router 산출 — 갈래 한 단어뿐이다.
     #

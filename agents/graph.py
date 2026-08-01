@@ -1,6 +1,6 @@
 """노드 배선 — route 한 단어로 갈래를 정하고, 공고 범위를 확정한 뒤 일한다.
 
-    router ─┬─ 검색 ──────────────→ bid_search ─────────────→ respond
+    rewrite → router ─┬─ 검색 ─────→ bid_search ─────────────→ respond
             ├─ 상세 → scope ─구했음──────────→ retrieval ───→ respond
             │            └─못구함─→ bid_search → retrieval ─→ respond
             ├─ 자격 → scope ────────────────→ eligibility ─→ respond
@@ -13,6 +13,7 @@
 from langgraph.graph import END, StateGraph
 
 from agents.nodes import bid_search as bid_search_mod
+from agents.nodes import rewrite as rewrite_mod
 from agents.nodes import scope as scope_mod
 from agents.nodes import stubs
 from agents.state import AgentState
@@ -76,7 +77,8 @@ def build_graph(router_node, respond_node,
                 retrieval_node=stubs.retrieval_node,
                 scoring_node=stubs.scoring_node,
                 scope_node=scope_mod.scope_node,
-                bid_search_node=bid_search_mod.bid_search_node):
+                bid_search_node=bid_search_mod.bid_search_node,
+                rewrite_node=rewrite_mod.rewrite_node):
     """그래프를 조립한다.
 
     scoring_node는 **배선하지 않는다.** [3a] 자격 매칭도 점수화는 B 실구현이
@@ -89,6 +91,7 @@ def build_graph(router_node, respond_node,
     라우트가 생기면 그때 배선한다.
     """
     g = StateGraph(AgentState)
+    g.add_node("rewrite", rewrite_node)
     g.add_node("router", router_node)
     g.add_node("scope", scope_node)
     g.add_node("bid_search", bid_search_node)
@@ -96,7 +99,11 @@ def build_graph(router_node, respond_node,
     g.add_node("retrieval", retrieval_node)
     g.add_node("respond", respond_node)
 
-    g.set_entry_point("router")
+    # rewrite가 진입점이다. 라우터보다 앞에 둬서 자기완결 질의를 넘긴다 —
+    # 라우터 라벨을 늘리지도, 루프를 만들지도 않는다(rewrite.py 참조).
+    # 조건에 안 맞으면 노드가 LLM을 부르지 않고 그대로 통과시킨다.
+    g.set_entry_point("rewrite")
+    g.add_edge("rewrite", "router")
     g.add_conditional_edges("router", _route_after_router, {
         "exit": END,
         "scope": "scope",
