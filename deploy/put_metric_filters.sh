@@ -89,9 +89,9 @@ echo "로그 그룹 ${LOG_GROUP} → 네임스페이스 ${NAMESPACE} (${REGION})
 # 1a/1b: 같은 로그 줄에 1차원 필터 두 개를 건다. 한 메트릭에 route·result 를 함께
 #   걸면 (route×result) 조합 시리즈만 생겨서 축별 합계를 매번 SEARCH 로 재집계해야
 #   한다. 쪼개는 쪽이 조회가 단순하고 시리즈 수도 적다.
-put turn-count   '{ $.event = "turn_end" }' TurnCount     1              Count        '{"route":"$.route"}'
+put turn-count   '{ $.event = "turn_end" }' TurnCount     1              Count        '{"route":"$.route_code"}'
 put turn-result  '{ $.event = "turn_end" }' TurnResult    1              Count        '{"result":"$.result"}'
-put turn-latency '{ $.event = "turn_end" }' TurnLatencyMs '$.total_ms'   Milliseconds '{"route":"$.route"}'
+put turn-latency '{ $.event = "turn_end" }' TurnLatencyMs '$.total_ms'   Milliseconds '{"route":"$.route_code"}'
 
 # ── LLM (llm_call / llm_retry) ─────────────────────────────────────────────
 # 토큰은 Bedrock 네이티브 메트릭에도 있다. 이쪽은 티어(라우터/합성)별로 갈리는 것이
