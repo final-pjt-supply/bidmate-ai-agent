@@ -1,0 +1,11 @@
+# 빌드 컨텍스트를 pyproject + agents/ 로만 제한한다(allowlist 방식).
+# 이 레포에는 `master table/`처럼 수십 MB짜리 시드 SQL·JSON이 있어서
+# denylist로 관리하면 새 데이터 디렉토리가 생길 때마다 컨텍스트가 조용히 불어난다.
+*
+
+!pyproject.toml
+!agents
+
+# 재포함된 agents/ 안에서 다시 걸러낼 것
+agents/**/__pycache__
+**/*.pyc

@@ -2,6 +2,16 @@
 #   sudo cp deploy/bidmate-agent.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now bidmate-agent
 #
+# ⚠ 포트 8010 (8001 아님). 8001은 백엔드 blue/green의 blue 슬롯이라
+# (`docker run --publish 127.0.0.1:8001:8000`) 에이전트가 점유하면 백엔드 배포가
+# 포트 충돌로 실패한다. 포트 지도는 deploy/CD.md 참고.
+#
+# ⚠ 이 유닛은 **EC2에 설치된 적이 없다**(2026-08-04 SSM 실측: is-enabled →
+# not-found). 실배포는 컨테이너 blue/green(deploy/deploy-blue-green.sh)으로
+# 바로 간다. 이 파일은 폴백·참조용으로만 남긴다 — 굳이 설치하지 말 것.
+# 설치된 상태에서 CD를 돌리면 스크립트가 blue(8011) 검증 후 이 유닛을 멈추고
+# nginx에 8010을 넘긴다(legacy cutover 경로).
+#
 # 로깅 배선(L2): Environment=LOG_JSON=1 이 구조화 JSON 로깅을 켜고(service.py),
 # StandardOutput=append: 가 stdout을 journald 대신 파일로 직행시킨다(JSON 한 줄 보존).
 # LogsDirectory= 가 /var/log/bidmate-agent 를 서비스 계정 소유로 자동 생성한다.
@@ -22,7 +32,7 @@ LogsDirectory=bidmate-agent
 StandardOutput=append:/var/log/bidmate-agent/agent.jsonl
 StandardError=append:/var/log/bidmate-agent/agent.jsonl
 ExecStart=/opt/bidmate-agent/.venv/bin/uvicorn agents.service:app \
-          --host 127.0.0.1 --port 8001 --workers 1
+          --host 127.0.0.1 --port 8010 --workers 1
 Restart=always
 RestartSec=3
 KillSignal=SIGINT
