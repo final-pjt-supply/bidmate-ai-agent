@@ -71,18 +71,36 @@ Variables:
 
 정책 원본은 `deploy/aws/`에 있다.
 
-- GitHub 역할: `bidmate-agent` ECR push, 지정 EC2 SSM 명령, 명령 결과 조회
-  (`github-actions-trust-policy.json`, `github-actions-permissions-policy.json`)
-- EC2 역할: `bidmate-agent` ECR pull (`ec2-ecr-pull-policy.json`) +
-  `/bidmate/agent` 로그 쓰기 (`ec2-agent-logs-policy.json`)
-- ECR: immutable tag, scan-on-push, 최근 이미지 30개 lifecycle
-  (`ecr-lifecycle-policy.json`)
+2026-08-04 실측 기준 상태를 함께 적는다.
 
-> **trust policy의 `sub` 형식 주의.** 백엔드는 조직/레포 ID가 박힌 형식
-> (`repo:final-pjt-supply@296341922/bidmate-backend@1309384344:ref:...`)을 쓴다.
-> 여기엔 표준 형식(`repo:final-pjt-supply/bidmate-ai-agent:ref:refs/heads/main`)을
-> 넣어뒀다. 역할을 만든 뒤 첫 OIDC 요청이 `AccessDenied`로 떨어지면 CloudTrail의
-> 실제 `sub` 클레임을 보고 그 값으로 맞춘다.
+| 항목 | 파일 | 상태 |
+|---|---|---|
+| ECR `bidmate-agent` (IMMUTABLE + 30개 lifecycle) | `ecr-lifecycle-policy.json` | **완료** |
+| GitHub OIDC provider | — | **완료** (백엔드가 만든 것 재사용) |
+| EC2 역할 `/bidmate/agent` 로그 쓰기 | — | **완료** — 아래 참고 |
+| GitHub 역할 (ECR push · SSM 명령 · 결과 조회) | `github-actions-{trust,permissions}-policy.json` | 미생성 |
+| EC2 역할 `bidmate-agent` ECR pull | `ec2-ecr-pull-policy.json` | 미부여 |
+
+**로그 쓰기 권한에 별도 정책이 필요 없다.** `bidmate-api-role`에 이미 붙어 있는
+관리형 `CloudWatchAgentServerPolicy`가 `logs:CreateLogStream`·`logs:PutLogEvents`·
+`logs:DescribeLogStreams`를 포함한다(실측 확인). 컨테이너의 `awslogs` 드라이버는
+그 권한만 있으면 된다.
+
+**EC2 역할의 ECR pull은 따로 붙여야 한다.** 기존 인라인 `BidmateBackendEcrPull`은
+Resource가 `repository/bidmate-backend` 하나뿐이라 에이전트 이미지를 못 당긴다.
+`ec2-ecr-pull-policy.json`을 **별개 인라인 정책**(예: `BidmateAgentEcrPull`)으로
+`bidmate-api-role`에 추가한다.
+
+> **trust policy의 `sub`는 백엔드 실물에서 확인한 형식이다.** 두 가지가 표준형과 다르다.
+>
+> 1. 조직·레포의 **숫자 ID**가 박힌다 — `final-pjt-supply@296341922`,
+>    `bidmate-ai-agent@1307308612`(GitHub API `/repos/...`의 `owner.id`·`id`).
+> 2. **`:ref:`가 아니라 `:environment:production`이다.** `cd.yml`의 job이
+>    `environment: production`을 선언하면 GitHub은 sub를 environment 기준으로
+>    발급한다. `:ref:refs/heads/main`을 넣으면 `AccessDenied`가 난다.
+>
+> 참고 — 백엔드:
+> `repo:final-pjt-supply@296341922/bidmate-backend@1309384344:environment:production`
 
 브리지 네트워크의 컨테이너가 EC2 역할을 받으려면 IMDSv2 응답 hop limit이 2여야 한다
 (백엔드 도입 때 이미 설정했다면 그대로면 된다).
@@ -124,7 +142,9 @@ CloudWatch Agent(`deploy/cloudwatch-agent.json`) → `/bidmate/agent`였다.
 - `LOG_JSON=1`은 이미지 `ENV`에 고정돼 있다(systemd `Environment=`와 같은 스위치).
 - `mode=non-blocking`이라 CloudWatch가 느려도 요청 처리를 막지 않는다.
 - `awslogs-create-group=false` — 로그 그룹이 없으면 컨테이너가 아예 안 뜬다.
-  `bootstrap-blue-green.sh`가 이걸 미리 경고한다.
+  `bootstrap-blue-green.sh`가 이걸 미리 경고한다. (2026-08-04 실측: 그룹은 이미
+  존재하고 보존 30일, 메트릭 필터 11종이 걸려 있다. 그 필터를 살리려고 이 그룹을
+  그대로 쓰는 것이다.)
 - 부작용: `docker logs`가 비게 된다. 실패 시 원인은 CloudWatch 스트림에 있고,
   롤백 로그가 스트림 이름을 찍어준다.
 

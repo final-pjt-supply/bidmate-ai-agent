@@ -10,7 +10,7 @@
       "Condition": {
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:final-pjt-supply/bidmate-ai-agent:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:final-pjt-supply@296341922/bidmate-ai-agent@1307308612:environment:production"
         }
       }
     }
