@@ -140,3 +140,66 @@ def test_llm_usage가_없어도_계측이_죽지_않는다(monkeypatch, caplog):
     rec = [r for r in caplog.records if getattr(r, "event", "") == "llm_call"][0]
     assert rec.tokens_in is None and rec.tokens_out is None
     assert get_turn_metrics()["llm_calls"] == 1   # 호출 수는 그래도 센다
+
+
+# ── ④ 제3자 로거 소음 정리 ───────────────────────────────────────
+# 루트 핸들러를 갈아끼우는 함수라 다른 테스트의 caplog를 밟지 않도록 복원한다.
+
+def _restore_logging(saved_handlers, saved_level, names):
+    root = logging.getLogger()
+    root.handlers[:] = saved_handlers
+    root.setLevel(saved_level)
+    for name, lvl in names.items():
+        logging.getLogger(name).setLevel(lvl)
+
+
+def test_제3자_로거는_WARNING으로_올라간다():
+    names = {n: logging.getLogger(n).level for n in lu._QUIET}
+    try:
+        logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+        logging.getLogger("botocore").setLevel(logging.DEBUG)
+        lu.quiet_third_party()
+        assert logging.getLogger("uvicorn.access").level == logging.WARNING
+        assert logging.getLogger("botocore").level == logging.WARNING
+        # 하루 2,880줄짜리 헬스체크 접근 로그가 실제로 막히는지
+        assert not logging.getLogger("uvicorn.access").isEnabledFor(logging.INFO)
+    finally:
+        _restore_logging(logging.getLogger().handlers[:],
+                         logging.getLogger().level, names)
+
+
+def test_setup_json_logging이_소음_정리를_함께_한다():
+    root = logging.getLogger()
+    saved, saved_level = root.handlers[:], root.level
+    names = {n: logging.getLogger(n).level for n in lu._QUIET}
+    try:
+        logging.getLogger("httpx").setLevel(logging.INFO)
+        lu.setup_json_logging()
+        assert logging.getLogger("httpx").level == logging.WARNING
+    finally:
+        _restore_logging(saved, saved_level, names)
+
+
+def test_우리_로거의_INFO는_그대로_남는다():
+    """소음 정리가 우리 이벤트까지 잡으면 대시보드가 통째로 빈다."""
+    root = logging.getLogger()
+    saved, saved_level = root.handlers[:], root.level
+    names = {n: logging.getLogger(n).level for n in lu._QUIET}
+    try:
+        lu.setup_json_logging()
+        assert logging.getLogger("agents.run").isEnabledFor(logging.INFO)
+        assert logging.getLogger("agents.logging_util").isEnabledFor(logging.INFO)
+    finally:
+        _restore_logging(saved, saved_level, names)
+
+
+def test_quiet를_끄면_제3자_레벨을_건드리지_않는다():
+    root = logging.getLogger()
+    saved, saved_level = root.handlers[:], root.level
+    names = {n: logging.getLogger(n).level for n in lu._QUIET}
+    try:
+        logging.getLogger("httpx").setLevel(logging.INFO)
+        lu.setup_json_logging(quiet=False)
+        assert logging.getLogger("httpx").level == logging.INFO
+    finally:
+        _restore_logging(saved, saved_level, names)
