@@ -1,0 +1,105 @@
+name: Agent CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # live 마커 테스트는 pytest.ini의 addopts로 이미 제외된다. 나머지 테스트가
+  # 실수로 실 AWS를 잡지 않도록 메타데이터 조회를 막고 리전만 고정한다.
+  AWS_DEFAULT_REGION: "ap-northeast-2"
+  AWS_EC2_METADATA_DISABLED: "true"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  test:
+    name: Python 3.12 tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout agent
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --editable ".[runtime,dev]"
+
+      - name: Compile Python sources
+        run: python -m compileall -q agents tests
+
+      - name: Import smoke test
+        run: |
+          python -c "from agents.service import app; assert app.title == 'BidMate Agent'"
+          python -c "import agents.run"
+
+      - name: Run tests
+        run: python -m pytest -q --maxfail=1
+
+      - name: Validate deployment shell
+        run: |
+          bash -n deploy/bootstrap-blue-green.sh
+          bash -n deploy/deploy-blue-green.sh
+
+  container:
+    name: Validate ARM64 image
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout agent
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ARM64 image without pushing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: false
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+          cache-from: type=gha,scope=agent-arm64
+          cache-to: type=gha,mode=max,scope=agent-arm64
+          provenance: false
+          sbom: false
+
+      - name: Validate Nginx slot configurations
+        shell: bash
+        run: |
+          for slot in blue green; do
+            docker run --rm \
+              --volume "${PWD}/deploy/nginx/${slot}.conf:/etc/nginx/conf.d/default.conf:ro" \
+              nginx:1.27-alpine nginx -t
+          done

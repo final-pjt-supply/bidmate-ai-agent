@@ -1,0 +1,6 @@
+# 배포 산출물은 Linux(EC2·GitHub runner)에서 실행된다. Windows 클라이언트가
+# CRLF로 커밋하면 `#!/usr/bin/env bash\r`가 되어 EC2에서 즉시 깨지므로 LF로 고정한다.
+*.sh        text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+Dockerfile  text eol=lf

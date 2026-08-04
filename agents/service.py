@@ -27,6 +27,23 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.get("/version")
+def version() -> dict:
+    """blue/green 전환이 실제로 일어났는지 확인하는 유일한 수단.
+
+    /health는 두 슬롯 다 200이라 nginx가 어느 쪽을 보는지 구별하지 못한다.
+    deploy-blue-green.sh가 전환 후 8010으로 이걸 때려서 version(커밋 SHA)과
+    slot이 방금 띄운 후보와 일치하는지 검사한다 — 불일치면 롤백.
+    두 값 모두 컨테이너 기동 시 주입된다(APP_VERSION은 Dockerfile ARG,
+    DEPLOYMENT_SLOT은 docker run --env). systemd 레거시로 뜨면 둘 다 없어
+    "dev"/"legacy"가 나오는데, 그 상태는 애초에 전환 대상이 아니다.
+    """
+    return {
+        "version": os.getenv("APP_VERSION", "dev"),
+        "slot": os.getenv("DEPLOYMENT_SLOT", "legacy"),
+    }
+
+
 @app.post("/turn", response_model=AgentResponse)
 def turn(req: AgentRequest) -> AgentResponse:
     # run_agent는 동기(Bedrock 블로킹). async가 아닌 def로 두면 FastAPI가
