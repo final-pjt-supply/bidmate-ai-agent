@@ -203,3 +203,27 @@ def test_quiet를_끄면_제3자_레벨을_건드리지_않는다():
         assert logging.getLogger("httpx").level == logging.INFO
     finally:
         _restore_logging(saved, saved_level, names)
+
+
+# ── route 차원용 ASCII 사본 ──────────────────────────────────────
+# CloudWatch가 한글 차원 값을 버리는 것을 우회한다. 이 키가 없어지면
+# D1의 route 패널 5개가 조용히 빈다 — 계약이므로 테스트로 못 박는다.
+
+def test_turn_end가_ASCII_route_code를_함께_싣는다(caplog):
+    with caplog.at_level(logging.INFO):
+        log_turn_end(route="검색", action="answer", result="answer", total_ms=1)
+    rec = [r for r in caplog.records if getattr(r, "event", "") == "turn_end"][0]
+    assert rec.route == "검색"
+    assert rec.route_code == "search"
+    assert rec.route_code.isascii()
+
+
+def test_네_갈래가_모두_ASCII로_매핑된다():
+    codes = [lu.route_code(r) for r in ("검색", "상세", "자격", "기타")]
+    assert codes == ["search", "detail", "eligibility", "other"]
+    assert all(c.isascii() for c in codes)
+
+
+def test_모르는_route는_unknown으로_떨어지고_죽지_않는다():
+    assert lu.route_code("새갈래") == "unknown"
+    assert lu.route_code(None) == "unknown"

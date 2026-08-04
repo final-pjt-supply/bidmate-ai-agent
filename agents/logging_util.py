@@ -133,6 +133,21 @@ def setup_json_logging(level: int = logging.INFO,
 
 # ── 턴 요약 이벤트 ───────────────────────────────────────────────
 
+# CloudWatch 차원 값은 ASCII만 안전하다. 한글 route("검색")를 그대로 차원으로
+# 쓰면 메트릭 필터가 그 차원을 통째로 버리고 무차원 계열만 남는다.
+#   실측(2026-08-04): 같은 turn_end 줄에서 ASCII인 result 차원은 생성됐고
+#   route 차원만 사라졌다. 같은 패턴·같은 이벤트이므로 값의 문자셋이 원인이다.
+# 그래프 분기는 Route 리터럴(한글)을 그대로 쓰고, 로그에만 ASCII 사본을 싣는다 —
+# 분기 로직을 건드리지 않으면서 차원만 살리는 최소 변경이다.
+_ROUTE_CODE = {"검색": "search", "상세": "detail",
+               "자격": "eligibility", "기타": "other"}
+
+
+def route_code(route) -> str:
+    """차원용 ASCII route. 모르는 값은 'unknown' — 계측이 주 경로를 깨지 않는다."""
+    return _ROUTE_CODE.get(str(route), "unknown")
+
+
 def log_turn_end(*, route, action: str, result: str,
                  total_ms: int, bids_shown: int = 0) -> None:
     """turn_end — 한 턴을 요약하는 한 줄. run_agent의 모든 반환 경로가 부른다.
@@ -145,7 +160,8 @@ def log_turn_end(*, route, action: str, result: str,
     logger.info(
         "turn_end route=%s action=%s result=%s total_ms=%d llm_calls=%d",
         route, action, result, total_ms, metrics.get("llm_calls", 0),
-        extra={"event": "turn_end", "route": str(route), "action": action,
+        extra={"event": "turn_end", "route": str(route),
+               "route_code": route_code(route), "action": action,
                "result": result, "total_ms": total_ms,
                "bids_shown": bids_shown, **metrics})
 
