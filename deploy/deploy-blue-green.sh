@@ -73,8 +73,18 @@ fi
 version="${image_uri##*:}"
 registry="${image_uri%%/*}"
 
+# ⚠ `readlink -f`는 마지막 경로 요소가 **없어도** 그 경로를 그대로 찍고 exit 0을 낸다.
+# 그대로 쓰면 최초 배포(링크 없음)가 "" 대신 ACTIVE_LINK 자기 자신을 돌려주고,
+# 아래 case의 `*)`에 걸려 "Unexpected Nginx active target"으로 죽는다.
+# 2026-08-04 첫 배포가 정확히 이걸로 실패했다. 존재 여부를 먼저 본다.
+resolve_active_link() {
+  if [[ -e "${ACTIVE_LINK}" || -L "${ACTIVE_LINK}" ]]; then
+    readlink -f "${ACTIVE_LINK}" 2>/dev/null || true
+  fi
+}
+
 active_slot=""
-linked_conf="$(readlink -f "${ACTIVE_LINK}" 2>/dev/null || true)"
+linked_conf="$(resolve_active_link)"
 case "${linked_conf}" in
   "${NGINX_ROOT}/blue.conf")
     active_slot="blue"
@@ -124,7 +134,7 @@ fi
 
 candidate_conf="${NGINX_ROOT}/${candidate_slot}.conf"
 log_stream="${candidate_slot}/${version}"
-previous_link="$(readlink -f "${ACTIVE_LINK}" 2>/dev/null || true)"
+previous_link="$(resolve_active_link)"
 legacy_was_active="false"
 legacy_stopped="false"
 switched="false"
