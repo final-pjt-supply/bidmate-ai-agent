@@ -89,13 +89,46 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(doc, ensure_ascii=False, default=str)
 
 
-def setup_json_logging(level: int = logging.INFO) -> None:
-    """루트 로거를 JSON 한 줄 출력으로 전환한다. 앱 진입점 전용."""
+# ── ④ 제3자 로거 소음 정리 ───────────────────────────────────────
+
+# 이 로거들의 줄은 우리 포매터를 타지 않아 JSON도 아니고, 메트릭 필터
+# ({ $.event = ... })에도 걸리지 않는다 — 값은 0인데 비용은 그대로다.
+# CloudWatch Logs는 수집량으로 과금되고, 컨테이너 전환 뒤에는 stdout이 awslogs
+# 드라이버로 곧장 로그 그룹에 들어가므로 걸러낼 지점이 여기밖에 없다.
+#   uvicorn.access  이미지 HEALTHCHECK가 30초마다 /health를 친다 → 하루 2,880줄
+#   httpx/httpcore  턴마다 외부 호출 1줄씩
+#   opensearch      질의마다 요청 1줄
+#   botocore/boto3  Bedrock 호출 경로의 내부 로그
+# 끄는 게 아니라 WARNING으로 올리는 것이다 — 진짜 오류는 그대로 올라온다.
+_QUIET = ("uvicorn.access", "httpx", "httpcore", "opensearch",
+          "botocore", "boto3", "urllib3", "s3transfer")
+
+
+def quiet_third_party(level: int = logging.WARNING) -> None:
+    """제3자·웹서버 로거를 WARNING 이상으로 올린다.
+
+    uvicorn은 자기 로거에 propagate=False로 핸들러를 따로 달기 때문에, 루트
+    핸들러를 갈아끼우는 것만으로는 access 로그가 잡히지 않는다. 레벨을 올리는
+    쪽이 uvicorn의 로깅 설정과 충돌하지 않으면서 확실하다.
+    """
+    for name in _QUIET:
+        logging.getLogger(name).setLevel(level)
+
+
+def setup_json_logging(level: int = logging.INFO,
+                       quiet: bool = True) -> None:
+    """루트 로거를 JSON 한 줄 출력으로 전환한다. 앱 진입점 전용.
+
+    quiet=True면 제3자 로거 소음도 함께 정리한다. 진입점은 둘 다 원하므로
+    기본값을 켜두고, 분리해서 쓰고 싶을 때만 끈다.
+    """
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
+    if quiet:
+        quiet_third_party()
 
 
 # ── 턴 요약 이벤트 ───────────────────────────────────────────────

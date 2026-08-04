@@ -35,10 +35,23 @@ put() {
 
   # dimensions 와 defaultValue 는 함께 쓸 수 없다(AWS 제약). 차원을 쓰는 필터는
   # 해당 필드가 없는 로그 줄에서 아무 값도 내지 않는다 — 그게 맞는 동작이다.
+  #
+  # 6번째 인자 규약:
+  #   '{"k":"$.f"}'  차원 있음        → defaultValue 없음
+  #   (생략)          차원 없음        → defaultValue 0 (빈 구간을 0으로 채운다)
+  #   '-'            차원 없음 + 기본값 없음
+  #
+  # '-' 가 왜 필요한가: defaultValue 는 **매칭되지 않은 모든 로그 줄마다 그 값을
+  # 낸다.** 카운터라면 0을 채워 그래프가 끊기지 않아 좋지만, **지연 시간에 쓰면
+  # 백분위가 망가진다** — 무관한 줄이 전부 0ms 표본으로 들어가 p95가 0으로
+  # 끌려 내려간다. 그래서 TurnLatencyAll 은 기본값 없이 등록한다.
   local transform
-  if [ -n "$dims" ]; then
+  if [ -n "$dims" ] && [ "$dims" != "-" ]; then
     transform=$(printf '[{"metricName":"%s","metricNamespace":"%s","metricValue":"%s","unit":"%s","dimensions":%s}]' \
       "$metric" "$NAMESPACE" "$value" "$unit" "$dims")
+  elif [ "$dims" = "-" ]; then
+    transform=$(printf '[{"metricName":"%s","metricNamespace":"%s","metricValue":"%s","unit":"%s"}]' \
+      "$metric" "$NAMESPACE" "$value" "$unit")
   else
     transform=$(printf '[{"metricName":"%s","metricNamespace":"%s","metricValue":"%s","unit":"%s","defaultValue":0}]' \
       "$metric" "$NAMESPACE" "$value" "$unit")
@@ -100,6 +113,17 @@ put node-latency '{ $.event = "node_exit" }' NodeLatencyMs '$.duration_ms' Milli
 put no-verdict-closed   '{ $.event = "no_verdict" }' NoVerdictClosed   '$.n_closed'    Count
 put no-verdict-notfound '{ $.event = "no_verdict" }' NoVerdictNotFound '$.n_not_found' Count
 put no-verdict-nodata   '{ $.event = "no_verdict" }' NoVerdictNoData   '$.n_no_data'   Count
+
+# ── 알람용 집계 메트릭 (차원 없음) ─────────────────────────────────────────
+# CloudWatch는 커스텀 메트릭을 차원 축으로 롤업해 주지 않는다. 위의 TurnCount는
+# route 차원이 붙어 있어 "전체 턴 수"라는 계열이 아예 존재하지 않는다. 대시보드는
+# 계열을 여러 개 겹쳐 그리면 되지만 **알람은 계열 하나를 지목해야 하므로**
+# 무차원 사본이 따로 필요하다(SEARCH 표현식은 알람에서 못 쓴다).
+# 같은 로그 그룹에 같은 패턴으로 필터를 하나 더 거는 것은 허용된다 — 차원 대신
+# defaultValue=0을 써서, 매칭이 없는 구간도 0으로 채운다.
+put turn-total       '{ $.event = "turn_end" }'  TurnTotal       1            Count        # 대화 두절 알람
+put turn-latency-all '{ $.event = "turn_end" }'  TurnLatencyAll  '$.total_ms' Milliseconds '-'  # p95 지연 알람 — 기본값 금지
+put llm-retry-total  '{ $.event = "llm_retry" }' LlmRetryTotal   1            Count        # 재시도 급증 알람
 
 # 아직 못 만드는 필터 3종(grounding·검색0건·임베딩 재시도)은 해당 경고에 event 코드가
 # 없어서다. A·C 협의 후 여기에 추가한다 — monitoring/metric_filters_spec.md 참조.
