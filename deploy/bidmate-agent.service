@@ -22,7 +22,7 @@ LogsDirectory=bidmate-agent
 StandardOutput=append:/var/log/bidmate-agent/agent.jsonl
 StandardError=append:/var/log/bidmate-agent/agent.jsonl
 ExecStart=/opt/bidmate-agent/.venv/bin/uvicorn agents.service:app \
-          --host 127.0.0.1 --port 8001 --workers 1
+          --host 127.0.0.1 --port 8010 --workers 1
 Restart=always
 RestartSec=3
 KillSignal=SIGINT
