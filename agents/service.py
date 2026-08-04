@@ -1,7 +1,6 @@
 """FastAPI 래퍼 — 백엔드가 HTTP로 부르는 에이전트 진입점.
 
 배포: uvicorn agents.service:app --host 127.0.0.1 --port 8010 --workers 1
-(8001은 백엔드 blue 슬롯이므로 쓰지 않는다 — 포트 지도는 deploy/CD.md)
 루프백 전용이라 앱 레벨 인증은 두지 않는다(바인드 주소·보안그룹으로 격리).
 에이전트는 stateless — 세션 컨텍스트는 요청(session_context)으로 들어오고
 응답(session_context)으로 나가며, 서버는 아무것도 저장하지 않는다.

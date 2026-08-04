@@ -12,6 +12,9 @@ from agents.nodes.retrieval import retrieval_node
 from agents.nodes.router import router_node
 from agents.schemas import (AgentRequest, AgentResponse, Filters,
                             SessionContext)
+from agents.tools.eligibility import (MISSING_CLOSED, MISSING_NO_DATA,
+                                      MISSING_NOT_FOUND,
+                                      missing_verdict_reasons)
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +78,24 @@ _ROUTE_ACTION: dict[str, str] = {
 #   목록 질의   자격이 되는 공고가 실제로 하나도 없음
 #   특정 공고   그 공고의 판정이 없음(대개 마감돼 계산 대상에서 빠진 경우)
 _NO_ELIGIBLE = "지금 자격 요건을 충족하는 공고가 없습니다."
-_NO_VERDICT = ("이 공고의 자격 판정 정보를 찾지 못했습니다. "
-               "마감된 공고는 판정 대상에서 제외됩니다.")
+
+# [N-2b] 판정이 없는 사유는 셋이고 안내도 셋이어야 한다. 종전에는 어느 경우든
+# "마감된 공고는 판정 대상에서 제외됩니다"라고 답했는데, 그중 둘에는 틀린
+# 안내였다 — 특히 살아있는데 요구조건 데이터가 아직 없는 갈래가 실측 151건이다.
+_NO_VERDICT_CLOSED = ("이 공고는 입찰이 마감되어 자격 판정 대상에서 제외됩니다.")
+_NO_VERDICT_NOT_FOUND = ("말씀하신 공고를 찾지 못했습니다. "
+                         "공고번호를 다시 확인해 주시겠어요?")
+_NO_VERDICT_NO_DATA = ("이 공고는 아직 자격 요건 정보가 정리되지 않아 판정을 "
+                       "드릴 수 없습니다. 정리되는 대로 판정이 제공됩니다.")
+# 사유를 알아내지 못했을 때의 폴백. **사유를 단정하지 않는다** — 안내가 없는
+# 것보다 틀린 안내가 나쁘다는 것이 이 작업의 출발점이었다.
+_NO_VERDICT = "이 공고의 자격 판정 정보를 찾지 못했습니다."
+
+_NO_VERDICT_BY_REASON = {
+    MISSING_CLOSED: _NO_VERDICT_CLOSED,
+    MISSING_NOT_FOUND: _NO_VERDICT_NOT_FOUND,
+    MISSING_NO_DATA: _NO_VERDICT_NO_DATA,
+}
 # 검색·상세인데 bid_search가 공고를 하나도 특정하지 못했을 때.
 _NOT_FOUND = ("질문에 해당하는 공고를 찾지 못했습니다. "
               "공고명이나 조건을 조금 더 알려주시면 다시 찾아보겠습니다.")
@@ -85,6 +104,30 @@ _NOT_FOUND = ("질문에 해당하는 공고를 찾지 못했습니다. "
 # 질의를 통한 프롬프트 인젝션이 성공해도 이 경로로는 한 글자도 새 나갈 수 없다.
 OUT_OF_SCOPE = ("입찰 공고 검색과 공고 내용 안내를 도와드릴 수 있습니다. "
                 "찾으시는 공고나 조건을 알려주세요.")
+
+
+def _no_verdict_answer(bid_id: str) -> str:
+    """판정이 없는 사유를 갈래별 문구로 고른다 (N-2b).
+
+    판별은 도구가 이미 가진 공개 함수(missing_verdict_reasons)를 쓴다 —
+    "살아있는 공고인가"를 여기서 새로 정의하면 검색·판정·목록이 서로 다른
+    답을 하게 된다(라이브 정의 사본 금지 원칙).
+
+    진단이 실패하면 사유를 단정하지 않는 문구로 되돌린다. 사유를 못 밝히는
+    것보다 틀린 사유를 말하는 것이 나쁘다.
+
+    ※ 같은 진단을 eligibility 도구가 로그용으로 한 번 더 돈다(왕복 1회 추가).
+      이 갈래는 드물고 조회가 가벼워 단순함을 택했다 — 없애려면 판정 노드가
+      사유를 state에 실어야 하고, 그건 상태 계약 변경이다.
+    """
+    try:
+        reason = missing_verdict_reasons([bid_id]).get(bid_id)
+    except Exception:                       # noqa: BLE001 — 아래서 폴백
+        logger.warning("판정 미제공 사유 진단 실패 — 사유 미상 문구로 답한다",
+                       exc_info=True,
+                       extra={"event": "no_verdict_diagnosis_failed"})
+        return _NO_VERDICT
+    return _NO_VERDICT_BY_REASON.get(reason, _NO_VERDICT)
 
 
 @lru_cache(maxsize=1)
@@ -172,7 +215,8 @@ def run_agent(req: AgentRequest) -> AgentResponse:
         # 판정 대상이 없다. 진입 공고가 있었다면 "그 공고 판정을 못 구했다"이고,
         # 없었다면 "자격 되는 공고가 없다"이다.
         if req.entry_context.bid_id:
-            answer, result_code = _NO_VERDICT, "no_verdict"
+            answer = _no_verdict_answer(req.entry_context.bid_id)
+            result_code = "no_verdict"
         else:
             answer, result_code = _NO_ELIGIBLE, "no_eligible"
     elif result["answer"] is None:

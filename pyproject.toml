@@ -1,6 +1,6 @@
 # bidmate-backend가 이 저장소를 pip 패키지로 설치하기 위한 메타데이터.
 # (backend requirements: bidmate-agents @ git+https://github.com/final-pjt-supply/bidmate-ai-agent.git)
-# 근거: 에이전트를 백엔드 프로세스에서 분리해 별도 프로세스(127.0.0.1:8001)로 운영.
+# 근거: 에이전트를 백엔드 프로세스에서 분리해 별도 프로세스(127.0.0.1:8010)로 운영.
 # 의존성 분리: 백엔드는 계약(schemas.py)만 가져가고, 런타임 전체는 [runtime] extra로 뺀다.
 [build-system]
 requires = ["setuptools>=69"]
