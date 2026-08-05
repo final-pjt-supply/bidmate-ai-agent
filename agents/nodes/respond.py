@@ -164,19 +164,44 @@ def render_answer(out: RespondOutput,
     항목이 있을 때만 쓰므로, 전부 버려진 공고는 빈 껍데기로 남지 않는다.
     """
     names = bid_names or {}
+
+    # 묶음의 기준은 **공고 ID**다. 예전에는 화면에 보이는 이름으로 묶었는데,
+    # 나라장터는 분할발주·재공고로 이름이 같은 다른 공고가 흔해서 서로 다른
+    # 두 공고가 한 머리줄 아래로 합쳐졌다 — 사용자에게는 "같은 내용이 두 번
+    # 적힌" 답변으로 보인다(2026-08-05 실사용 화면에서 발견).
+    label_of = {i.bid_id: sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+                for i in out.items}
+    # 이름이 겹치는 공고는 머리줄만으로 구별되지 않는다. 이때만 공고번호를
+    # 덧붙인다 — 평소에는 사용자가 읽을 이유가 없는 식별자다.
+    _seen_labels: dict[str, int] = {}
+    for lbl in label_of.values():
+        _seen_labels[lbl] = _seen_labels.get(lbl, 0) + 1
+    ambiguous = {lbl for lbl, n in _seen_labels.items() if n > 1}
+
     lines = [sanitize(out.headline)]
     prev_bid = None
+    emitted: set[tuple[str, str, str]] = set()
     for i in out.items:
-        bid_label = sanitize(_squeeze(names.get(i.bid_id) or i.bid_id))
+        bid_label = label_of[i.bid_id]
         if _is_redundant(i, bid_label):
             logger.warning("render: 공고 이름을 되풀이하는 항목 제거 (label=%r)",
                            i.label)
             continue
-        if bid_label != prev_bid:
-            lines.append(f"- {bid_label}:")
-            prev_bid = bid_label
         text = sanitize(i.text)
         item_label = sanitize(_squeeze(i.label))
+        # 같은 공고에 같은 항목이 두 번 오면 버린다. 모델이 항목을 되풀이해도
+        # 사용자 눈에는 렌더러 버그로 보이므로 여기서 흡수한다.
+        key = (i.bid_id, item_label, text)
+        if key in emitted:
+            logger.warning("render: 중복 항목 제거 (bid=%s label=%r)",
+                           i.bid_id, i.label)
+            continue
+        emitted.add(key)
+        if i.bid_id != prev_bid:
+            head = (f"{bid_label} (공고번호 {i.bid_id})"
+                    if bid_label in ambiguous else bid_label)
+            lines.append(f"- {head}:")
+            prev_bid = i.bid_id
         lines.append(f"  · {item_label} : {text}" if item_label
                      else f"  · {text}")
     if out.caveat:
