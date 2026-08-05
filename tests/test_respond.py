@@ -453,8 +453,10 @@ def _item(bid_id, label, text):
 
 
 def _render(items, names):
+    # caveat 는 기본값 없는 필수 필드다 — 위 _out() 헬퍼와 같은 규약.
     return render_answer(RespondOutput(headline="총 2건입니다.",
-                                       items=[BidItem(**i) for i in items]),
+                                       items=[BidItem(**i) for i in items],
+                                       caveat=None),
                          bid_names=names)
 
 
