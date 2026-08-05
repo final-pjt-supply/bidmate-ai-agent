@@ -406,3 +406,38 @@ def test_N5_여러_사유가_섞여도_해당_축에만_붙는다():
                                           actual="보유 인증 3종")]))
     assert sig.count("→") == 1                     # cert 에만
     assert "경상북도 / 보유 경기도;" in sig or "경상북도 / 보유 경기도 |" in sig
+
+
+# ── 신호 머리줄과 실제 정렬의 정합성 ─────────────────────────────
+# 2026-07-30에 기본 정렬을 '마감 임박 순' → '우선순위 순(P1-lite)'으로 바꿨는데
+# respond의 머리줄 문자열이 따라가지 않아, 배포된 챗봇이 "마감 임박 5건"이라고
+# 말하면서 실제로는 다른 순서를 보여준 적이 있다(2026-08-05 실사용 화면에서 발견).
+# 정렬 기준을 또 바꾸면 여기가 먼저 깨지게 못 박아 둔다.
+
+def test_머리줄은_마감_임박이라고_말하지_않는다():
+    sig = _eligibility_block({"eligibility": [_elig("가능")],
+                              "eligible_total": 25})
+    head = sig.splitlines()[0]
+    assert "마감" not in head, f"정렬은 우선순위 순인데 머리줄이 마감을 말한다: {head}"
+    assert "상위" in head
+
+
+def test_머리줄이_전체_건수와_보여준_건수와_나머지를_모두_싣는다():
+    """N을 빼먹으면 사용자가 5건이 전부인 줄 안다. 나머지 수는 뺄셈이라
+    신호에 없으면 grounding 위반으로 잡혀 재생성이 한 번 더 돈다."""
+    sig = _eligibility_block({"eligibility": [_elig("가능")],
+                              "eligible_total": 25})
+    head = sig.splitlines()[0]
+    assert "25" in head and "1건" in head and "24" in head
+
+
+def test_전체가_보여준_수_이하면_머리줄에_나머지를_적지_않는다():
+    sig = _eligibility_block({"eligibility": [_elig("가능")],
+                              "eligible_total": 0})
+    assert "나머지" not in sig.splitlines()[0]
+
+
+def test_프롬프트가_마감_임박_표현을_금지한다():
+    """머리줄을 고쳐도 모델이 마감일을 보고 '임박'을 지어낼 수 있다.
+    프롬프트 층의 금지문이 두 번째 방어선이다."""
+    assert "마감이 임박한 순이 아니다" in respond_mod._TASK_ELIGIBILITY

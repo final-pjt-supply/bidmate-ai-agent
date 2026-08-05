@@ -4,7 +4,8 @@
 resolved_filters["bid_ids"]로 넘어가고, 뒤 노드는 그 범위 안에서만 일한다.
 
     entry_bid 있음   → 그 공고 (화면 문맥이 가장 강한 신호)
-    자격 + 없음      → match_results에서 verdict='가능' 마감 임박 순 상위 N건
+    자격 + 없음      → match_results에서 verdict='가능' 우선순위 순 상위 N건
+                       (P1-lite: 게이트 축 수 → supp 충족 축 수 → 추정가격)
     상세 + 없음      → 빈 리스트 — bid_search 노드가 검색으로 찾는다
 
 bid_ids는 못 구했을 때도 **빈 리스트로 채운다.** 뒤 분기(graph._found_bids)가
