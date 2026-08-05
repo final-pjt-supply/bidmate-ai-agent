@@ -37,15 +37,16 @@ Pull request
 전부 루프백 바인딩이라 보안그룹 변경이 없다. 백엔드가 HTTP로 전환할 때
 base_url을 `http://127.0.0.1:8010`으로 잡는다(백엔드 레포 변경 — 아래 참고).
 
-## 아직 트래픽 경로가 아니다
+## 실트래픽 경로다 (2026-08-04부터)
 
-`bidmate-backend/app/agents/chat_service.py`가 `from agents.run import run_agent`로
-같은 프로세스에서 직접 호출한다(ADR 0005 임베드). 즉 **지금 이 CD를 돌려도 실제
-사용자 트래픽은 여기를 지나지 않는다.** 실제 배포 경로는 여전히 "백엔드가 이미지
-빌드 시 git에서 `bidmate-agents`를 당겨오는 것"이다.
+백엔드가 `app/agents/agent_client.py`로 `POST http://127.0.0.1:8010/turn`을 호출한다.
+전환 커밋(`f0bc0db`)이 2026-08-04 머지·배포됐다. **이 CD가 실패하면 사용자가 보는
+에이전트 응답이 옛 버전에 머문다** — 더 이상 리허설이 아니다.
 
-백엔드가 `httpx.Client(base_url="http://127.0.0.1:8010")`로 `/turn`을 부르도록
-바꾸는 순간부터 이 파이프라인이 트래픽 경로가 된다. 그 전까지는 배포 리허설이다.
+다만 **계약(`agents.schemas`)은 아직 pip 핀**이다. 백엔드가 요청·응답 모델을
+`bidmate-agents` 패키지에서 import하고 `app/requirements.txt`가 커밋 SHA로 고정한다.
+따라서 노드·프롬프트 변경은 이 CD만으로 반영되지만, `schemas.py`를 바꾸면 백엔드
+requirements의 SHA를 올리고 백엔드를 재배포해야 한다.
 
 ## GitHub 설정
 
@@ -158,7 +159,10 @@ CloudWatch Agent(`deploy/cloudwatch-agent.json`) → `/bidmate/agent`였다.
 
 1. `/health`: FastAPI 프로세스 생존
 2. boto3가 EC2 역할 자격증명을 얻는지 확인 (Bedrock·RDS·OpenSearch 전제)
-3. Nginx 전환 후 `/version`: SHA와 슬롯 일치 — **전환 여부를 증명하는 유일한 검사**
+3. Nginx 전환 후 `/version`: SHA와 슬롯 일치 — **전환 여부를 증명하는 유일한 검사**.
+   단발이 아니라 15회 × 2초 폴링(`wait_for_version`)이다. graceful reload는 구 워커가
+   drain되는 동안에도 새 연결을 받아서, 직후 한 번만 읽으면 구 슬롯이 답한다
+   (2026-08-05 첫 blue→green 전환이 이걸로 롤백됐다).
 4. `POST /turn` 빈 본문 → 422: 라우팅과 `AgentRequest` 계약 생존
 
 백엔드에 있는 `/ready`는 두지 않았다. 에이전트는 DB 스키마를 소유하지 않고, 실제

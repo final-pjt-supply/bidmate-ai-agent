@@ -219,6 +219,30 @@ wait_for_endpoint() {
   return 1
 }
 
+# ⚠ nginx graceful reload는 구 워커가 drain되는 동안에도 새 연결을 받는다. reload
+# 직후에 /version을 한 번만 읽으면 구 슬롯이 답하고, 멀쩡한 후보를 두고 "전환
+# 실패"로 판정해 롤백한다. 2026-08-05 첫 blue→green 전환이 정확히 이걸로 실패했다
+# (최초 배포는 nginx를 새로 띄우는 경로라 구 워커가 없어 8/4에는 안 드러났다).
+# 백엔드 wait_for_version 이식 — 재시도 15회 × 2초.
+wait_for_version() {
+  local expect_slot="$1" expect_version="$2" payload _
+
+  for _ in $(seq 1 15); do
+    payload="$(
+      curl --fail --silent --max-time 5 \
+        "http://127.0.0.1:${PUBLIC_PORT}/version" 2>/dev/null || true
+    )"
+    if [[ "${payload}" == *"\"version\":\"${expect_version}\""* &&
+          "${payload}" == *"\"slot\":\"${expect_slot}\""* ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  echo "Nginx did not switch to ${expect_slot}: ${payload}" >&2
+  return 1
+}
+
 echo "Authenticating the EC2 role to ${registry}."
 aws ecr get-login-password --region "${aws_region}" \
   | docker login --username AWS --password-stdin "${registry}" >/dev/null
@@ -281,15 +305,8 @@ wait_for_endpoint "http://127.0.0.1:${PUBLIC_PORT}/health"
 
 # /health는 두 슬롯 다 200이라 전환 여부를 구별하지 못한다. /version만이 nginx가
 # 실제로 후보 슬롯을 보고 있음을 증명한다(service.py의 /version 주석 참고).
-version_payload="$(
-  curl --fail --silent --show-error --max-time 5 \
-    "http://127.0.0.1:${PUBLIC_PORT}/version"
-)"
-if [[ "${version_payload}" != *"\"version\":\"${version}\""* ||
-      "${version_payload}" != *"\"slot\":\"${candidate_slot}\""* ]]; then
-  echo "Nginx did not switch to ${candidate_slot}: ${version_payload}" >&2
-  false
-fi
+# 단발이 아니라 폴링이다 — 위 wait_for_version 주석의 drain 창 때문.
+wait_for_version "${candidate_slot}" "${version}"
 
 # 계약 스모크: 빈 본문 POST가 422여야 한다. FastAPI 라우팅과 AgentRequest 검증이
 # 살아 있다는 뜻이다. 정상 /turn을 때리면 배포마다 Bedrock 토큰을 태우므로 쓰지 않는다.
