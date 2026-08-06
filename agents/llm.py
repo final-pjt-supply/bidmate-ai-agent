@@ -10,7 +10,14 @@ from functools import lru_cache
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError, ReadTimeoutError
+# ConnectionError는 파이썬 내장과 이름이 겹쳐 별칭으로 임포트한다.
+# 2026-08-06 트러블슈팅: ConnectionClosedError(Bedrock이 응답 전 연결을 끊음)가
+# 어느 예외 계열에도 안 잡혀 재시도 없이 500으로 새어 나갔다(→ API 502).
+# botocore 버전에 따라 ConnectionClosedError의 부모가 ConnectionError였다가
+# HTTPClientError로 바뀌었으므로(1.43 기준 HTTPClientError) 두 계열을 모두 잡는다.
+# ReadTimeoutError·ConnectTimeoutError·EndpointConnectionError도 이 둘로 커버된다.
+from botocore.exceptions import ClientError, HTTPClientError
+from botocore.exceptions import ConnectionError as BotoConnectionError
 from dotenv import load_dotenv
 
 from agents.logging_util import add_turn_metric
@@ -63,7 +70,11 @@ def _client():
         region_name=BEDROCK_REGION,
         aws_access_key_id=os.environ["AWS_ACCESS_KEY"],
         aws_secret_access_key=os.environ["AWS_SECRET_KEY"],
-        config=Config(read_timeout=120, retries={"max_attempts": 0}),
+        # retries=0: 재시도는 아래 invoke() 루프가 전담(중복 재시도 방지).
+        # tcp_keepalive: 풀에 쉬고 있는 커넥션이 중간 장비(NAT/LB)에서 조용히
+        # 끊기는 것을 줄인다 — ConnectionClosedError 완화(근본 해결은 재시도).
+        config=Config(read_timeout=120, retries={"max_attempts": 0},
+                      tcp_keepalive=True),
     )
 
 
@@ -112,14 +123,16 @@ def invoke(tier: ModelTier, messages: list[dict], system: str | None = None,
             add_turn_metric("tokens_in", int(usage.get("input_tokens") or 0))
             add_turn_metric("tokens_out", int(usage.get("output_tokens") or 0))
             return json.loads(text) if output_schema else text
-        except (ClientError, ReadTimeoutError) as e:
+        except (ClientError, BotoConnectionError, HTTPClientError) as e:
             ms = (time.monotonic() - start) * 1000
             if isinstance(e, ClientError):
                 code = e.response["Error"]["Code"]
                 if code not in _RETRYABLE:
                     raise
             else:
-                code = "ReadTimeoutError"
+                # 연결 계열(ConnectionClosedError·ReadTimeoutError 등)은 전부
+                # 일시 장애로 보고 재시도한다. 클래스명이 곧 로그의 code.
+                code = type(e).__name__
             if attempt == _MAX_ATTEMPTS:
                 logger.warning("llm retry exhausted attempts=%d code=%s",
                                attempt, code,
