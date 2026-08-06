@@ -112,6 +112,36 @@ def test_retry_on_read_timeout(monkeypatch, caplog):
                for r in caplog.records if r.levelname == "WARNING")
 
 
+def test_retry_on_connection_closed(monkeypatch, caplog):
+    """2026-08-06 502 장애 회귀 테스트 — Bedrock이 응답 전에 연결을 끊는
+    ConnectionClosedError는 재시도 대상이어야 한다(과거엔 안 잡혀 500 유출)."""
+    from botocore.exceptions import ConnectionClosedError
+    err = ConnectionClosedError(endpoint_url="https://bedrock.example.com")
+    client = MagicMock()
+    client.invoke_model.side_effect = [err, _fake_response("ok")]
+    monkeypatch.setattr(llm, "_client", lambda: client)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+
+    out = llm.invoke(ModelTier.ROUTER, [{"role": "user", "content": "hi"}])
+    assert out == "ok"
+    assert any("retry" in r.message and "ConnectionClosedError" in r.message
+               for r in caplog.records if r.levelname == "WARNING")
+
+
+def test_connection_closed_exhausted_raises(monkeypatch):
+    """연결 계열도 _MAX_ATTEMPTS 소진 시에는 그대로 올라간다(무한 재시도 금지)."""
+    from botocore.exceptions import ConnectionClosedError
+    err = ConnectionClosedError(endpoint_url="https://bedrock.example.com")
+    client = MagicMock()
+    client.invoke_model.side_effect = err
+    monkeypatch.setattr(llm, "_client", lambda: client)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+
+    with pytest.raises(ConnectionClosedError):
+        llm.invoke(ModelTier.ROUTER, [{"role": "user", "content": "hi"}])
+    assert client.invoke_model.call_count == 4  # _MAX_ATTEMPTS
+
+
 def test_invoke_raises_when_no_text_block(monkeypatch):
     client = MagicMock()
     body = MagicMock()
